@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hosted-tinker"
+version = "0.3.0"
+description = "Tinker API server for RL training — standalone extraction from SkyRL"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "cloudpathlib>=0.23.0",
+    "rich>=14.0.0",
+    "fastapi[standard]",
+    "sqlmodel",
+    "sqlalchemy[asyncio]",
+    "aiosqlite",
+    "asyncpg",
+    "psycopg2-binary",
+    "httpx",
+    "psutil",
+]
+
+[project.optional-dependencies]
+# Backends (install skyrl with the corresponding extra)
+jax = ["skyrl[jax]"]
+fsdp = ["skyrl[fsdp]"]
+megatron = ["skyrl[megatron]"]
+# Cloud storage
+aws = ["cloudpathlib[s3]"]
+gcp = ["cloudpathlib[gs]"]
+azure = ["cloudpathlib[azure]"]
+# Migrations
+alembic = ["alembic"]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "alembic",
+]
+
+[tool.setuptools.packages.find]
+include = ["hosted_tinker*"]
+
+[tool.ruff]
+line-length = 120

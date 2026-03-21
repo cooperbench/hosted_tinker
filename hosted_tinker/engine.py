@@ -174,9 +174,13 @@ def get_backend_classes(backend_name: str):
         from skyrl.backends.skyrl_train_backend import SkyRLTrainBackend, MegatronBackendOverrides
 
         return SkyRLTrainBackend, MegatronBackendOverrides
+    elif backend_name == "pytorch":
+        from hosted_tinker.pytorch_backend import PyTorchBackend, PyTorchBackendConfig
+
+        return PyTorchBackend, PyTorchBackendConfig
     else:
         raise ValueError(
-            f"Unknown backend: {backend_name}. Available backends: jax, fsdp, megatron. "
+            f"Unknown backend: {backend_name}. Available backends: jax, fsdp, megatron, pytorch. "
             f"Make sure the backend's dependencies are installed (e.g., pip install skyrl[jax])"
         )
 

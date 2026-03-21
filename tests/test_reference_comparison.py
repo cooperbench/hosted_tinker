@@ -28,9 +28,10 @@ import tinker
 
 from .conftest import make_cross_entropy_datum, make_ppo_datum, make_random_tokens
 
-CLOUD_URL = os.environ.get("TINKER_CLOUD_URL")
-if not CLOUD_URL:
-    pytestmark = pytest.mark.skip(reason="TINKER_CLOUD_URL not set — skipping reference comparison tests")
+CLOUD_URL = os.environ.get("TINKER_CLOUD_URL", "default")
+_CLOUD_API_KEY = os.environ.get("TINKER_API_KEY")
+if not _CLOUD_API_KEY or _CLOUD_API_KEY == "tml-dummy":
+    pytestmark = pytest.mark.skip(reason="No real TINKER_API_KEY set — skipping reference comparison tests")
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +40,9 @@ if not CLOUD_URL:
 
 @pytest.fixture(scope="module")
 def cloud_service() -> tinker.ServiceClient:
-    return tinker.ServiceClient(base_url=CLOUD_URL)
+    if CLOUD_URL and CLOUD_URL != "default":
+        return tinker.ServiceClient(base_url=CLOUD_URL)
+    return tinker.ServiceClient()  # uses official API with default URL
 
 
 @pytest.fixture(scope="module")
@@ -289,21 +292,95 @@ class TestOptimStepComparison:
 class TestLongSequenceComparison:
     """Compare on longer sequences (stress test for numerical precision)."""
 
-    @pytest.mark.parametrize("length", [512, 2048])
+    @pytest.mark.parametrize("length", [512, 2048, 8192, 32768])
     def test_long_sequence_logprobs_match(self, paired_clients, tokenizer, length):
-        """Logprobs match on longer sequences."""
+        """Logprobs match on longer sequences including 32K."""
         cloud_tc, local_tc = paired_clients
 
         tokens = make_random_tokens(tokenizer, length, seed=42)
         datum = make_cross_entropy_datum(tokens, train_start=length // 2)
 
-        cloud_result = cloud_tc.forward([datum], loss_fn="cross_entropy").result(timeout=600)
-        local_result = local_tc.forward([datum], loss_fn="cross_entropy").result(timeout=600)
+        cloud_result = cloud_tc.forward([datum], loss_fn="cross_entropy").result(timeout=1200)
+        local_result = local_tc.forward([datum], loss_fn="cross_entropy").result(timeout=1200)
 
         cloud_lp = _extract_logprobs(cloud_result)
         local_lp = _extract_logprobs(local_result)
 
+        # Report statistics
+        diff = np.abs(cloud_lp - local_lp)
+        print(f"\n  length={length}: max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}, "
+              f"cloud_mean_lp={cloud_lp.mean():.4f}, local_mean_lp={local_lp.mean():.4f}")
+
         np.testing.assert_allclose(
             cloud_lp, local_lp, rtol=1e-2, atol=1e-3,
             err_msg=f"Logprobs differ at length={length}",
+        )
+
+
+class TestTrainingAt32K:
+    """Train on 32K sequences and compare gradient descent results."""
+
+    def test_32k_forward_backward_logprobs_match(self, cloud_service, local_service, model_name, lora_rank, tokenizer):
+        """forward_backward at 32K tokens: logprobs match between backends."""
+        cloud_tc = cloud_service.create_lora_training_client(
+            base_model=model_name, rank=lora_rank, seed=0,
+        )
+        local_tc = local_service.create_lora_training_client(
+            base_model=model_name, rank=lora_rank, seed=0,
+        )
+
+        tokens = make_random_tokens(tokenizer, 32768, seed=99)
+        datum = make_cross_entropy_datum(tokens, train_start=len(tokens) // 2)
+
+        cloud_result = cloud_tc.forward_backward([datum], loss_fn="cross_entropy").result(timeout=1200)
+        local_result = local_tc.forward_backward([datum], loss_fn="cross_entropy").result(timeout=1200)
+
+        cloud_lp = _extract_logprobs(cloud_result)
+        local_lp = _extract_logprobs(local_result)
+
+        diff = np.abs(cloud_lp - local_lp)
+        print(f"\n  32K forward_backward: max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}")
+
+        np.testing.assert_allclose(
+            cloud_lp, local_lp, rtol=1e-2, atol=1e-3,
+            err_msg="32K forward_backward logprobs differ",
+        )
+
+    def test_32k_training_step_match(self, cloud_service, local_service, model_name, lora_rank, tokenizer):
+        """After training on 32K tokens, weights match (measured via logprobs on eval data)."""
+        cloud_tc = cloud_service.create_lora_training_client(
+            base_model=model_name, rank=lora_rank, seed=0,
+        )
+        local_tc = local_service.create_lora_training_client(
+            base_model=model_name, rank=lora_rank, seed=0,
+        )
+
+        # Train on 32K sequence
+        tokens = make_random_tokens(tokenizer, 32768, seed=77)
+        datum = make_cross_entropy_datum(tokens, train_start=len(tokens) // 2)
+
+        cloud_tc.forward_backward([datum], loss_fn="cross_entropy").result(timeout=1200)
+        local_tc.forward_backward([datum], loss_fn="cross_entropy").result(timeout=1200)
+
+        adam = tinker.AdamParams(learning_rate=1e-3, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0)
+        cloud_tc.optim_step(adam).result(timeout=120)
+        local_tc.optim_step(adam).result(timeout=120)
+
+        # Evaluate on short sequence (fast) — if weights match, logprobs match
+        eval_tokens = tokenizer.encode("Evaluate parameters after training on 32K tokens.")
+        eval_datum = make_cross_entropy_datum(eval_tokens)
+
+        cloud_result = cloud_tc.forward([eval_datum], loss_fn="cross_entropy").result(timeout=300)
+        local_result = local_tc.forward([eval_datum], loss_fn="cross_entropy").result(timeout=300)
+
+        cloud_lp = _extract_logprobs(cloud_result)
+        local_lp = _extract_logprobs(local_result)
+
+        diff = np.abs(cloud_lp - local_lp)
+        print(f"\n  32K train+eval: max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}")
+
+        # After training on 32K, allow slightly more tolerance for accumulated FP precision
+        np.testing.assert_allclose(
+            cloud_lp, local_lp, rtol=5e-2, atol=5e-3,
+            err_msg="Post-32K-training logprobs differ — parameters diverged",
         )

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from skyrl.backends.backend import AbstractBackend
+from hosted_tinker.backend import AbstractBackend
 from hosted_tinker import types
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,9 @@ class PyTorchBackendConfig(BaseModel, extra="forbid"):
     torch_dtype: str = Field(default="bfloat16", description="Model dtype (bfloat16, float16, float32)")
     micro_batch_size: int = Field(default=1, description="Micro-batch size for gradient accumulation")
     loss_chunk_size: int = Field(default=1024, description="Chunk size for logprob computation (0=full)")
+    # vLLM LoRA sync: after each optim_step, save LoRA weights and reload on vLLM
+    vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync (e.g., http://localhost:8001)")
+    lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir to save LoRA weights for vLLM")
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +492,48 @@ class PyTorchBackend(AbstractBackend):
         optimizer.zero_grad()
         accum.reset()
 
+        # Sync LoRA weights to vLLM if configured
+        if self.config.vllm_sync_url:
+            self._sync_lora_to_vllm(model_id)
+
         return types.OptimStepOutput(metrics={
             "skyrl.ai/grad_norm": grad_norm,
             "skyrl.ai/learning_rate": adam.learning_rate,
         })
+
+    def _sync_lora_to_vllm(self, model_id: str) -> None:
+        """Save LoRA weights and reload on vLLM."""
+        from hosted_tinker.vllm_manager import save_lora_for_vllm
+
+        adapter_dir = self.config.lora_sync_dir
+        save_path = save_lora_for_vllm(self.model, adapter_dir, adapter_name=model_id)
+
+        try:
+            # Reload on vLLM
+            url = self.config.vllm_sync_url
+            requests_mod = __import__("requests")
+
+            # Unload old adapter
+            try:
+                requests_mod.post(
+                    f"{url}/v1/unload_lora_adapter",
+                    json={"lora_name": model_id}, timeout=30,
+                )
+            except Exception:
+                pass
+
+            # Load new adapter
+            r = requests_mod.post(
+                f"{url}/v1/load_lora_adapter",
+                json={"lora_name": model_id, "lora_path": os.path.abspath(save_path)},
+                timeout=60,
+            )
+            if r.status_code == 200:
+                logger.info(f"Synced LoRA to vLLM: {model_id}")
+            else:
+                logger.warning(f"vLLM LoRA reload: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"vLLM LoRA sync failed: {e}")
 
     def sample(
         self,

@@ -178,6 +178,10 @@ def get_backend_classes(backend_name: str):
         from hosted_tinker.pytorch_backend import PyTorchBackend, PyTorchBackendConfig
 
         return PyTorchBackend, PyTorchBackendConfig
+    elif backend_name == "fsdp2":
+        from hosted_tinker.fsdp2_backend import FSDP2Backend, FSDP2BackendConfig
+
+        return FSDP2Backend, FSDP2BackendConfig
     else:
         raise ValueError(
             f"Unknown backend: {backend_name}. Available backends: jax, fsdp, megatron, pytorch. "

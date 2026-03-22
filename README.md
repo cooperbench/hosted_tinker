@@ -145,7 +145,20 @@ training operations (forward, forward_backward, optim_step) across all sequence 
 from 512 to 32K. The only difference is the initial model loading time (151s for first
 call vs 0.8s on cloud where models are pre-loaded).
 
-### Qwen3-30B-A3B: Self-Hosted vs Official Tinker API (with vLLM inference)
+### Inference Latency: Self-Hosted vLLM vs Official Tinker API
+
+Qwen3.5-35B-A3B sampling/generation:
+
+| Prompt | Max Tokens | Self-Hosted (vLLM TP=4) | Official Tinker | Ratio |
+|---|---|---|---|---|
+| Short | 20 | **1.4s** | 3.2s | **2.3× faster** |
+| Medium | 100 | **6.6s** | 8.1s | **1.2× faster** |
+| Long | 500 | 33.3s | **25.7s** | 0.8× |
+
+Self-hosted vLLM is **2.3× faster for short prompts** (lower latency) but the official
+Tinker API is faster for long generation (500 tokens) due to optimized batching.
+
+### Qwen3-30B-A3B: Training with vLLM inference
 
 PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 
@@ -155,9 +168,6 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | forward_backward | 1,024 | 0.7s | 0.8s | **1.25×** |
 | forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
 | forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
-| inference (short) | 20 tok | 1.4s | N/A | — |
-| inference (medium) | 100 tok | 6.6s | N/A | — |
-| inference (long) | 500 tok | 33.3s | N/A | — |
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

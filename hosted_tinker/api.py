@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
 
     # Auto-launch vLLM if vllm_gpus is configured (split-GPU mode)
     app.state.vllm_process = None
-    if app.state.engine_config.vllm_gpus and not app.state.engine_config.external_inference_url:
+    if app.state.engine_config.vllm_gpus.strip() and not app.state.engine_config.external_inference_url:
         from hosted_tinker.vllm_manager import VLLMManager
         vllm_cfg = app.state.engine_config
         gpu_ids = [int(g) for g in vllm_cfg.vllm_gpus.split(",")]

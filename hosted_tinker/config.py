@@ -50,8 +50,8 @@ class EngineConfig(BaseModel):
         description="Seconds without heartbeat before session is considered stale. Set to -1 to disable cleanup.",
     )
     # vLLM inference server (auto-launched for split-GPU mode)
-    vllm_gpus: str | None = Field(
-        default=None,
+    vllm_gpus: str = Field(
+        default="",
         description="GPU IDs for vLLM inference (e.g., '4,5,6,7'). If set, auto-launches vLLM.",
     )
     vllm_port: int = Field(default=8001, description="Port for vLLM inference server")

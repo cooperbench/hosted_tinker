@@ -154,6 +154,8 @@ def save_lora_for_vllm(
 ) -> str:
     """Extract LoRA weights from a PEFT model and save in vLLM-compatible format.
 
+    Uses PEFT's save_pretrained for proper adapter format that vLLM can load.
+
     Args:
         model: PEFT model (from get_peft_model)
         adapter_dir: Base directory to save adapter
@@ -162,38 +164,37 @@ def save_lora_for_vllm(
     Returns:
         Path to the saved adapter directory
     """
-    import json
-    import torch
-    from safetensors.torch import save_file
-
     save_path = os.path.join(adapter_dir, adapter_name)
     os.makedirs(save_path, exist_ok=True)
 
-    # Extract LoRA weights to CPU
-    lora_state = {
-        k: v.cpu().contiguous()
-        for k, v in model.state_dict().items()
-        if "lora_" in k or "modules_to_save" in k
-    }
+    try:
+        # Use PEFT's save_pretrained — produces adapter_model.safetensors + adapter_config.json
+        # in the correct format for vLLM
+        model.save_pretrained(save_path, safe_serialization=True)
+        logging.getLogger(__name__).info(f"Saved LoRA adapter to {save_path}")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"save_pretrained failed ({e}), falling back to manual save")
+        # Fallback: manual save (may not work with vLLM)
+        import json
+        from safetensors.torch import save_file
 
-    save_file(lora_state, os.path.join(save_path, "adapter_model.safetensors"))
+        lora_state = {
+            k: v.cpu().contiguous()
+            for k, v in model.state_dict().items()
+            if "lora_" in k or "modules_to_save" in k
+        }
+        save_file(lora_state, os.path.join(save_path, "adapter_model.safetensors"))
 
-    # Save adapter config
-    if hasattr(model, "peft_config"):
-        for cfg_name, peft_cfg in model.peft_config.items():
-            cfg_dict = peft_cfg.to_dict() if hasattr(peft_cfg, "to_dict") else {}
-            # Convert sets to lists for JSON
-            def _serialize(obj):
-                if isinstance(obj, set):
-                    return list(obj)
-                if isinstance(obj, dict):
-                    return {k: _serialize(v) for k, v in obj.items()}
-                if isinstance(obj, (list, tuple)):
-                    return [_serialize(v) for v in obj]
-                return obj
-            cfg_dict = _serialize(cfg_dict)
-            with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-                json.dump(cfg_dict, f)
-            break  # Only save first config
+        if hasattr(model, "peft_config"):
+            for cfg_name, peft_cfg in model.peft_config.items():
+                cfg_dict = peft_cfg.to_dict() if hasattr(peft_cfg, "to_dict") else {}
+                def _serialize(obj):
+                    if isinstance(obj, set): return list(obj)
+                    if isinstance(obj, dict): return {k: _serialize(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple)): return [_serialize(v) for v in obj]
+                    return obj
+                with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+                    json.dump(_serialize(cfg_dict), f)
+                break
 
     return save_path

@@ -32,10 +32,12 @@ logger = logging.getLogger(__name__)
 class MegatronBackendConfig(BaseModel, extra="forbid"):
     """Configuration for the Megatron backend."""
 
-    n_train_gpus: int = Field(default=4, description="Number of GPUs for training (TP size)")
+    n_train_gpus: int = Field(default=4, description="Number of GPUs for training")
     train_gpu_offset: int = Field(default=0, description="First GPU index for training")
     gradient_checkpointing: bool = Field(default=True, description="Enable activation checkpointing")
     micro_batch_size: int = Field(default=1, description="Micro-batch size for gradient accumulation")
+    # Worker mode: "ddp" (HF model, data parallel) or "tp" (Megatron-Core, tensor parallel)
+    mode: str = Field(default="ddp", description="Worker mode: ddp (any model) or tp (Megatron Bridge models only)")
     # vLLM LoRA sync
     vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync")
     lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir for LoRA weight sync")
@@ -74,7 +76,11 @@ class MegatronBackend(AbstractBackend):
                              self.config.train_gpu_offset + self.config.n_train_gpus))
         master_port = random.randint(29500, 29999)
 
-        worker_module = "hosted_tinker.megatron_worker"
+        # Select worker based on mode
+        if self.config.mode == "tp":
+            worker_module = "hosted_tinker.megatron_tp_worker"
+        else:
+            worker_module = "hosted_tinker.megatron_worker"
         cmd = [
             sys.executable, "-m", "torch.distributed.run",
             "--nproc_per_node", str(self.config.n_train_gpus),

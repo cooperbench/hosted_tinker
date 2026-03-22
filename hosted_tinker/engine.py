@@ -186,6 +186,13 @@ def get_backend_classes(backend_name: str):
         from hosted_tinker.megatron_backend import MegatronBackend, MegatronBackendConfig
 
         return MegatronBackend, MegatronBackendConfig
+    elif backend_name == "megatron_tp":
+        from hosted_tinker.megatron_backend import MegatronBackend, MegatronBackendConfig
+
+        # Override mode to TP
+        class MegatronTPConfig(MegatronBackendConfig):
+            mode: str = "tp"
+        return MegatronBackend, MegatronTPConfig
     else:
         raise ValueError(
             f"Unknown backend: {backend_name}. Available backends: jax, fsdp, megatron, pytorch. "

@@ -56,6 +56,10 @@ def main():
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
 
+    # Create a Gloo group for object-based collectives (broadcast_object_list, etc.)
+    # NCCL's implementation of these hangs on B200 Blackwell GPUs.
+    gloo_group = dist.new_group(backend="gloo")
+
     if rank == 0:
         logger.info(f"Megatron worker: {world_size} GPUs, model={args.base_model}, lora_rank={args.lora_rank}")
 
@@ -107,7 +111,7 @@ def main():
                 cmd_data[0] = pickle.load(f)
             os.unlink(args.cmd_file)
 
-        dist.broadcast_object_list(cmd_data, src=0)
+        dist.broadcast_object_list(cmd_data, src=0, group=gloo_group)
         cmd = cmd_data[0]
 
         if cmd["type"] == "shutdown":
@@ -167,33 +171,20 @@ def main():
 
                 del out, target_lp
 
-            # Gather results to rank 0.
-            # NOTE: all_gather_object / gather_object HANG on B200.
-            # Use tensor-based gather: serialize per-rank results to a byte tensor,
-            # all_gather the byte tensors, then deserialize on rank 0.
-            my_result_bytes = pickle.dumps(
-                {i: (all_lp[i], all_loss[i]) for i in range(my_start, my_end) if all_lp[i] is not None}
-            )
-            # Pad all byte tensors to same length
-            local_size = torch.tensor([len(my_result_bytes)], device=device, dtype=torch.long)
-            all_sizes = [torch.zeros(1, device=device, dtype=torch.long) for _ in range(world_size)]
-            dist.all_gather(all_sizes, local_size)
-            max_size = max(s.item() for s in all_sizes)
-
-            padded = torch.zeros(max_size, device=device, dtype=torch.uint8)
-            padded[:len(my_result_bytes)] = torch.tensor(list(my_result_bytes), dtype=torch.uint8, device=device)
-            gathered_tensors = [torch.zeros(max_size, device=device, dtype=torch.uint8) for _ in range(world_size)]
-            dist.all_gather(gathered_tensors, padded)
+            # Gather results to rank 0 via Gloo all_gather_object
+            # (NCCL object collectives hang on B200 Blackwell, use Gloo group instead)
+            my_result = {i: (all_lp[i], all_loss[i]) for i in range(my_start, my_end) if all_lp[i] is not None}
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, my_result, group=gloo_group)
 
             if rank == 0:
                 merged_lp = [None] * n_examples
                 merged_loss = [None] * n_examples
-                for r_idx in range(world_size):
-                    sz = all_sizes[r_idx].item()
-                    rank_data = pickle.loads(gathered_tensors[r_idx][:sz].cpu().numpy().tobytes())
-                    for i, (lp, ls) in rank_data.items():
-                        merged_lp[i] = lp
-                        merged_loss[i] = ls
+                for rank_data in gathered:
+                    if rank_data:
+                        for i, (lp, ls) in rank_data.items():
+                            merged_lp[i] = lp
+                            merged_loss[i] = ls
 
                 with open(args.result_file, "wb") as f:
                     pickle.dump({"logprobs": merged_lp, "losses": merged_loss}, f)

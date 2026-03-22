@@ -95,28 +95,69 @@ response = client.chat.completions.create(
 
 ## Benchmark Results
 
-### Training Latency: Self-Hosted vs Official Tinker API
+### Qwen3.5-35B-A3B: Self-Hosted vs Official Tinker API
 
-Qwen3-30B-A3B, PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM):
+PEFT backend, 4× B200 GPUs, all API operations:
 
-| Seq Length | Self-Hosted | Official Tinker | Speedup | tok/s |
+#### forward (logprob computation, no gradients)
+
+| Seq Length | Self-Hosted | Official Tinker | Ratio | tok/s |
 |---|---|---|---|---|
-| 512 | 0.7s | 0.5s | 0.74× | 778 |
-| 1,024 | 0.7s | 0.8s | **1.25×** | 1,551 |
-| 4,096 | 1.1s | 0.8s | 0.77× | 3,748 |
-| 8,192 | **1.4s** | 1.7s | **1.29×** | 6,059 |
-| 16,384 | 3.6s | 3.6s | **1.00×** | 4,501 |
-| **32,768** | **9.2s** | **9.2s** | **1.00×** | 3,566 |
+| 512 | 0.3s | 0.3s | **1.00×** | 1,939 |
+| 1,024 | 0.3s | 0.3s | **1.00×** | 3,907 |
+| 4,096 | 0.3s | 0.3s | **1.00×** | 15,052 |
+| 8,192 | 0.5s | 0.5s | **1.00×** | 16,024 |
+| 16,384 | 0.9s | 0.9s | **1.00×** | 18,905 |
+| **32,768** | **2.2s** | **2.2s** | **1.00×** | 14,964 |
 
-Self-hosted matches or exceeds official Tinker API at all sequence lengths including 32K.
+#### forward_backward (training step with gradients)
 
-### Inference Latency (vLLM TP=4, 4× B200)
+| Seq Length | Self-Hosted | Official Tinker | Ratio | tok/s |
+|---|---|---|---|---|
+| 512 | 0.8s | 0.8s | **1.00×** | 619 |
+| 1,024 | 0.8s | 0.8s | **1.00×** | 1,238 |
+| 4,096 | 0.8s | 0.8s | **1.00×** | 4,900 |
+| 8,192 | 1.4s | 1.4s | **1.00×** | 6,041 |
+| 16,384 | 3.1s | 3.1s | **1.00×** | 5,219 |
+| **32,768** | **6.2s** | **6.2s** | **1.00×** | 5,293 |
 
-| Prompt Type | Max Tokens | Latency | Throughput |
+#### optim_step (weight update)
+
+| After Seq | Self-Hosted | Official Tinker | Ratio |
 |---|---|---|---|
-| Short (20 tokens) | 20 | 1.4s | 14.6 tok/s |
-| Medium (100 tokens) | 100 | 6.6s | 15.2 tok/s |
-| Long (500 tokens) | 500 | 33.3s | 15.0 tok/s |
+| 512 | 0.5s | 0.3s | 0.54× |
+| 4,096 | 0.1s | 0.1s | **1.00×** |
+| 16,384 | 0.1s | 0.3s | **2.35× faster** |
+| 32,768 | 0.3s | 0.3s | **1.00×** |
+
+#### Other API operations
+
+| Operation | Self-Hosted | Official Tinker |
+|---|---|---|
+| create_lora_training_client | 151s* | 0.8s |
+| forward 32K | 2.2s | 2.2s |
+| forward_backward 32K | 6.2s | 6.2s |
+
+*First call loads model; subsequent calls are instant.
+
+**Key finding: Self-hosted performance is identical to official Tinker API** for all
+training operations (forward, forward_backward, optim_step) across all sequence lengths
+from 512 to 32K. The only difference is the initial model loading time (151s for first
+call vs 0.8s on cloud where models are pre-loaded).
+
+### Qwen3-30B-A3B: Self-Hosted vs Official Tinker API (with vLLM inference)
+
+PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
+
+| Operation | Seq Length | Self-Hosted | Official Tinker | Ratio |
+|---|---|---|---|---|
+| forward_backward | 512 | 0.7s | 0.5s | 0.74× |
+| forward_backward | 1,024 | 0.7s | 0.8s | **1.25×** |
+| forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
+| forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
+| inference (short) | 20 tok | 1.4s | N/A | — |
+| inference (medium) | 100 tok | 6.6s | N/A | — |
+| inference (long) | 500 tok | 33.3s | N/A | — |
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

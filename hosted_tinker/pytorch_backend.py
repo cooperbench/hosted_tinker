@@ -38,6 +38,8 @@ class PyTorchBackendConfig(BaseModel, extra="forbid"):
     torch_dtype: str = Field(default="bfloat16", description="Model dtype (bfloat16, float16, float32)")
     micro_batch_size: int = Field(default=1, description="Micro-batch size for gradient accumulation")
     loss_chunk_size: int = Field(default=1024, description="Chunk size for logprob computation (0=full)")
+    # GPU restriction: limit which GPUs the model uses (for split-GPU mode)
+    train_gpus: str = Field(default="", description="GPU IDs for training (e.g., '0,1,2,3'). Empty = all GPUs.")
     # vLLM LoRA sync: after each optim_step, save LoRA weights and reload on vLLM
     vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync (e.g., http://localhost:8001)")
     lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir to save LoRA weights for vLLM")
@@ -222,6 +224,22 @@ class PyTorchBackend(AbstractBackend):
         self.torch_dtype = dtype_map.get(config.torch_dtype, torch.bfloat16)
 
         # Load base model
+        # Determine device_map: restrict to train_gpus if specified
+        if config.train_gpus.strip():
+            gpu_ids = [int(g) for g in config.train_gpus.split(",")]
+            # Build max_memory dict to constrain device_map="auto"
+            import torch as _torch
+            max_memory = {}
+            for i in range(_torch.cuda.device_count()):
+                if i in gpu_ids:
+                    max_memory[i] = f"{int(_torch.cuda.get_device_properties(i).total_memory * 0.9 / 1024**3)}GiB"
+                else:
+                    max_memory[i] = "0GiB"  # Don't use this GPU
+            max_memory["cpu"] = "80GiB"
+            logger.info(f"Restricting model to GPUs {gpu_ids}")
+        else:
+            max_memory = None
+
         logger.info(f"Loading base model: {base_model}")
         start = time.time()
         try:
@@ -229,6 +247,7 @@ class PyTorchBackend(AbstractBackend):
                 base_model,
                 torch_dtype=self.torch_dtype,
                 device_map="auto",
+                max_memory=max_memory,
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2",
             )
@@ -238,6 +257,7 @@ class PyTorchBackend(AbstractBackend):
                 base_model,
                 torch_dtype=self.torch_dtype,
                 device_map="auto",
+                max_memory=max_memory,
                 trust_remote_code=True,
             )
         self.tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)

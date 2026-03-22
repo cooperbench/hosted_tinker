@@ -182,6 +182,10 @@ def get_backend_classes(backend_name: str):
         from hosted_tinker.fsdp2_backend import FSDP2Backend, FSDP2BackendConfig
 
         return FSDP2Backend, FSDP2BackendConfig
+    elif backend_name in ("megatron_local", "ddp"):
+        from hosted_tinker.megatron_backend import MegatronBackend, MegatronBackendConfig
+
+        return MegatronBackend, MegatronBackendConfig
     else:
         raise ValueError(
             f"Unknown backend: {backend_name}. Available backends: jax, fsdp, megatron, pytorch. "

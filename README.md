@@ -15,15 +15,16 @@ A standalone, self-hosted implementation of the [Tinker](https://tinker-docs.thi
 
 | Model | PEFT Backend | DDP Backend | Megatron TP | Notes |
 |---|---|---|---|---|
-| **Qwen3-30B-A3B** | ✅ | ✅ | ✅ TP≤4 | Full support via AutoBridge |
-| **Qwen3.5-35B-A3B** | ✅ 32K | ✅ | ❌ | GDN layers not in Megatron-Core yet |
+| **Qwen3-30B-A3B** | ✅ | ✅ | ✅ TP≤4 (14.5GB/GPU) | Full support via AutoBridge |
+| **Qwen3.5-35B-A3B** | ✅ 32K | ✅ | ✅ TP≤2 (33.5GB/GPU)* | GDN + MoE via nightly bridge |
 | Llama 3.x | ✅ | ✅ | ✅ | Standard transformer |
 | Any HuggingFace model | ✅ | ✅ | Requires Bridge | |
 
-> **Qwen3.5 note**: The Gated DeltaNet (GDN) architecture in Qwen3.5 is recognized by
-> Megatron Bridge 0.4.0rc0 but the GDN layer implementation is not yet in Megatron-Core.
-> Use the PEFT backend for Qwen3.5 training (supports 32K tokens, 55s/step on B200).
-> Megatron TP gives 4× memory savings but only works with standard transformer models.
+> **Qwen3.5 Megatron TP**: Requires nightly packages:
+> - `megatron-core` 0.16.0rc0+ (from `git+https://github.com/NVIDIA/Megatron-LM.git@main`)
+> - `megatron-bridge` 0.4.0rc0+ (from `git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@main`)
+> - TP max = 2 (Qwen3.5 has only 2 KV heads)
+> - *Multi-GPU TP blocked on B200 by NCCL bug; works on H100 or single GPU
 
 ## Quick Start
 

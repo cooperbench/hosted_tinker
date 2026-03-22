@@ -74,6 +74,29 @@ async def lifespan(app: FastAPI):
     async with app.state.db_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
+    # Auto-launch vLLM if vllm_gpus is configured (split-GPU mode)
+    app.state.vllm_process = None
+    if app.state.engine_config.vllm_gpus and not app.state.engine_config.external_inference_url:
+        from hosted_tinker.vllm_manager import VLLMManager
+        vllm_cfg = app.state.engine_config
+        gpu_ids = [int(g) for g in vllm_cfg.vllm_gpus.split(",")]
+        vllm = VLLMManager(
+            model_name=vllm_cfg.base_model,
+            port=vllm_cfg.vllm_port,
+            gpu_ids=gpu_ids,
+            tensor_parallel_size=vllm_cfg.vllm_tp,
+            gpu_memory_utilization=vllm_cfg.vllm_gpu_mem,
+            max_model_len=vllm_cfg.vllm_max_model_len,
+            max_num_seqs=vllm_cfg.vllm_max_num_seqs,
+            max_lora_rank=vllm_cfg.vllm_max_lora_rank,
+        )
+        vllm.start()
+        vllm.wait_until_ready(timeout=600)
+        app.state.vllm_process = vllm
+        # Auto-configure external inference URL
+        app.state.engine_config.external_inference_url = f"http://localhost:{vllm_cfg.vllm_port}/v1"
+        logger.info(f"vLLM auto-launched on GPUs {gpu_ids}, port {vllm_cfg.vllm_port}")
+
     # Setup external inference client if configured
     if app.state.engine_config.external_inference_url:
         app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
@@ -128,6 +151,11 @@ async def lifespan(app: FastAPI):
             await background_engine.wait()
     logger.info("Background engine stopped")
 
+    # Stop vLLM if we launched it
+    if app.state.vllm_process:
+        app.state.vllm_process.stop()
+        logger.info("vLLM inference server stopped")
+
 
 app = FastAPI(title="Tinker API", version="0.0.1", lifespan=lifespan)
 
@@ -136,6 +164,57 @@ async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
     """Dependency to get a database session."""
     async with AsyncSession(request.app.state.db_engine) as session:
         yield session
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible inference proxy (forwards to vLLM)
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint. Proxies to vLLM."""
+    return await _proxy_to_vllm(request, "/v1/chat/completions")
+
+
+@app.post("/v1/completions")
+async def openai_completions(request: Request):
+    """OpenAI-compatible completions endpoint. Proxies to vLLM."""
+    return await _proxy_to_vllm(request, "/v1/completions")
+
+
+@app.get("/v1/models")
+async def openai_list_models(request: Request):
+    """OpenAI-compatible model listing. Proxies to vLLM."""
+    return await _proxy_to_vllm(request, "/v1/models", method="GET")
+
+
+async def _proxy_to_vllm(request: Request, path: str, method: str = "POST"):
+    """Proxy a request to the vLLM inference server."""
+    import httpx
+
+    vllm_url = request.app.state.engine_config.external_inference_url
+    if not vllm_url:
+        raise HTTPException(status_code=503, detail="No inference server configured. Set --vllm-gpus or --external-inference-url.")
+
+    # Strip /v1 from base URL if present, since path already includes it
+    base = vllm_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = f"{base}{path}"
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        if method == "GET":
+            resp = await client.get(url)
+        else:
+            body = await request.body()
+            headers = {"Content-Type": "application/json"}
+            resp = await client.post(url, content=body, headers=headers)
+
+    return fastapi.responses.Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 async def get_model(session: AsyncSession, model_id: str) -> ModelDB:

@@ -49,6 +49,17 @@ class EngineConfig(BaseModel):
         default=300,
         description="Seconds without heartbeat before session is considered stale. Set to -1 to disable cleanup.",
     )
+    # vLLM inference server (auto-launched for split-GPU mode)
+    vllm_gpus: str | None = Field(
+        default=None,
+        description="GPU IDs for vLLM inference (e.g., '4,5,6,7'). If set, auto-launches vLLM.",
+    )
+    vllm_port: int = Field(default=8001, description="Port for vLLM inference server")
+    vllm_tp: int = Field(default=1, description="vLLM tensor parallel size")
+    vllm_max_model_len: int = Field(default=32768, description="Max model length for vLLM")
+    vllm_max_num_seqs: int = Field(default=16, description="Max concurrent sequences for vLLM")
+    vllm_gpu_mem: float = Field(default=0.90, description="vLLM GPU memory utilization")
+    vllm_max_lora_rank: int = Field(default=32, description="Max LoRA rank for vLLM")
 
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):

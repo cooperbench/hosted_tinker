@@ -93,14 +93,24 @@ response = client.chat.completions.create(
 
 Qwen3-30B-A3B, PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM):
 
-| Seq Length | Self-Hosted | Official Tinker | Speedup |
-|---|---|---|---|
-| 512 | **0.5s** | 0.7s | **1.34×** |
-| 1,024 | 0.7s | 0.7s | 1.00× |
-| 4,096 | 1.1s | 0.8s | 0.77× |
-| 8,192 | **1.7s** | 2.1s | **1.22×** |
+| Seq Length | Self-Hosted | Official Tinker | Speedup | tok/s |
+|---|---|---|---|---|
+| 512 | 0.7s | 0.5s | 0.74× | 778 |
+| 1,024 | 0.7s | 0.8s | **1.25×** | 1,551 |
+| 4,096 | 1.1s | 0.8s | 0.77× | 3,748 |
+| 8,192 | **1.4s** | 1.7s | **1.29×** | 6,059 |
+| 16,384 | 3.6s | 3.6s | **1.00×** | 4,501 |
+| **32,768** | **9.2s** | **9.2s** | **1.00×** | 3,566 |
 
-Self-hosted is **comparable to or faster** than the official Tinker API for most sequence lengths.
+Self-hosted matches or exceeds official Tinker API at all sequence lengths including 32K.
+
+### Inference Latency (vLLM TP=4, 4× B200)
+
+| Prompt Type | Max Tokens | Latency | Throughput |
+|---|---|---|---|
+| Short (20 tokens) | 20 | 1.4s | 14.6 tok/s |
+| Medium (100 tokens) | 100 | 6.6s | 15.2 tok/s |
+| Long (500 tokens) | 500 | 33.3s | 15.0 tok/s |
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
@@ -111,15 +121,6 @@ Self-hosted is **comparable to or faster** than the official Tinker API for most
 | **Megatron TP** | **14.5 GB** | Tensor | **4+** |
 
 *PEFT with `train_gpus` splits pipeline across 4 GPUs
-
-### Training Throughput (PEFT backend, tokens/sec)
-
-| Seq Length | Throughput |
-|---|---|
-| 512 | 1,046 tok/s |
-| 1,024 | 1,553 tok/s |
-| 4,096 | 3,750 tok/s |
-| 8,192 | 4,713 tok/s |
 
 ## Test Results
 

@@ -59,18 +59,36 @@ def main():
 
     bridge = AutoBridge.from_hf_pretrained(args.base_model, trust_remote_code=True)
     provider = bridge.to_megatron_provider()
+
+    # Check KV heads constraint: TP must be <= num_key_value_heads
+    hf_config = provider._config if hasattr(provider, '_config') else None
+    if hf_config and hasattr(hf_config, 'num_key_value_heads'):
+        max_tp = hf_config.num_key_value_heads
+        if world_size > max_tp:
+            raise ValueError(
+                f"TP={world_size} exceeds num_key_value_heads={max_tp} for {args.base_model}. "
+                f"Use --nproc_per_node={max_tp} or fewer."
+            )
+
     provider.tensor_model_parallel_size = world_size
     provider.pipeline_model_parallel_size = 1
     # For MoE models, set expert parallelism
     if hasattr(provider, 'expert_model_parallel_size'):
-        # With TP=world_size, EP must be 1 (TP*EP <= world_size)
         provider.expert_model_parallel_size = 1
     provider.finalize()
 
-    models = provider.provide_distributed_model(wrap_with_ddp=False)
-    # provide_distributed_model returns a list (one per PP stage). With PP=1, take the first.
-    model = models[0] if isinstance(models, list) else models
-    model = model.to(torch.bfloat16)
+    try:
+        models = provider.provide_distributed_model(wrap_with_ddp=False)
+        model = models[0] if isinstance(models, list) else models
+        if model is None:
+            raise RuntimeError("Model provider returned None — architecture not fully supported in Megatron-Core")
+        model = model.to(torch.bfloat16)
+    except Exception as e:
+        if rank == 0:
+            logger.error(f"Megatron model creation failed: {e}")
+            logger.error(f"This model may not be supported by Megatron Bridge. "
+                         f"Use --backend pytorch (PEFT) or --backend ddp instead.")
+        raise
 
     if args.gradient_checkpointing:
         # Megatron's activation checkpointing

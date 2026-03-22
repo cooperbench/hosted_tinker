@@ -15,10 +15,15 @@ A standalone, self-hosted implementation of the [Tinker](https://tinker-docs.thi
 
 | Model | PEFT Backend | DDP Backend | Megatron TP | Notes |
 |---|---|---|---|---|
-| **Qwen3-30B-A3B** | ✅ | ✅ | ✅ (AutoBridge) | Full support |
-| **Qwen3.5-35B-A3B** | ✅ | ✅ | 🔧 (nightly bridge) | Gated DeltaNet architecture |
+| **Qwen3-30B-A3B** | ✅ | ✅ | ✅ TP≤4 | Full support via AutoBridge |
+| **Qwen3.5-35B-A3B** | ✅ 32K | ✅ | ❌ | GDN layers not in Megatron-Core yet |
 | Llama 3.x | ✅ | ✅ | ✅ | Standard transformer |
 | Any HuggingFace model | ✅ | ✅ | Requires Bridge | |
+
+> **Qwen3.5 note**: The Gated DeltaNet (GDN) architecture in Qwen3.5 is recognized by
+> Megatron Bridge 0.4.0rc0 but the GDN layer implementation is not yet in Megatron-Core.
+> Use the PEFT backend for Qwen3.5 training (supports 32K tokens, 55s/step on B200).
+> Megatron TP gives 4× memory savings but only works with standard transformer models.
 
 ## Quick Start
 

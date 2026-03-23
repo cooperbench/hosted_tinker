@@ -74,6 +74,32 @@ response = client.chat.completions.create(
 )
 ```
 
+## Remote Access (GCP)
+
+The API is publicly accessible when running on GCP VMs tagged with `tinker-server`:
+
+```bash
+# Get the external IP
+gcloud compute instances describe tinker-bench --zone=us-east1-b \
+    --format="value(networkInterfaces[0].accessConfigs[0].natIP)"
+
+# Access from any machine
+curl http://<EXTERNAL_IP>:8000/api/v1/healthz
+```
+
+```python
+# From any machine with tinker SDK
+import tinker
+service = tinker.ServiceClient(base_url="http://<EXTERNAL_IP>:8000")
+tc = service.create_lora_training_client(base_model="Qwen/Qwen3.5-35B-A3B", rank=32)
+
+# OpenAI inference from anywhere
+from openai import OpenAI
+client = OpenAI(base_url="http://<EXTERNAL_IP>:8000/v1", api_key="not-needed")
+```
+
+> Note: External IP changes on each spot VM restart. The `launch.sh` script prints the current IP.
+
 ## Backends
 
 ### PEFT (default)

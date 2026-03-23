@@ -102,17 +102,19 @@ class ModelInput(BaseModel):
 
 class TensorData(BaseModel):
     data: list[int] | list[float]
+    dtype: str | None = None
+    shape: list[int] | None = None
 
 
 class LossFnInputs(BaseModel):
     target_tokens: TensorData
-    weights: TensorData
-    advantages: TensorData
-    logprobs: TensorData
+    weights: TensorData | None = None
+    advantages: TensorData | None = None
+    logprobs: TensorData | None = None
 
 
 class Datum(BaseModel):
-    loss_fn_inputs: LossFnInputs
+    loss_fn_inputs: LossFnInputs | dict
     model_input: ModelInput
 
 

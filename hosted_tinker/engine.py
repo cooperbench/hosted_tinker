@@ -133,11 +133,27 @@ def prepare_model_pass_batch(
         for item in request_data.data:
             tokens = [t for chunk in item.model_input.chunks for t in chunk.tokens]
             all_input_ids.append(tokens)
-            loss_fn_inputs = item.loss_fn_inputs
-            all_targets.append(loss_fn_inputs.target_tokens.data)
-            all_token_weights.append(loss_fn_inputs.weights.data)
-            all_sampling_logprobs.append(loss_fn_inputs.logprobs.data)
-            all_advantages.append(loss_fn_inputs.advantages.data)
+            seq_len = len(tokens)
+
+            # Handle both LossFnInputs model and raw dict from tinker SDK
+            lfi = item.loss_fn_inputs
+            if isinstance(lfi, dict):
+                def _get_data(field):
+                    v = lfi.get(field)
+                    if v is None:
+                        return None
+                    if isinstance(v, dict):
+                        return v.get("data")
+                    return v.data if hasattr(v, "data") else None
+                all_targets.append(_get_data("target_tokens") or [0] * seq_len)
+                all_token_weights.append(_get_data("weights") or [1.0] * seq_len)
+                all_sampling_logprobs.append(_get_data("logprobs") or [0.0] * seq_len)
+                all_advantages.append(_get_data("advantages") or [0.0] * seq_len)
+            else:
+                all_targets.append(lfi.target_tokens.data)
+                all_token_weights.append(lfi.weights.data if lfi.weights else [1.0] * seq_len)
+                all_sampling_logprobs.append(lfi.logprobs.data if lfi.logprobs else [0.0] * seq_len)
+                all_advantages.append(lfi.advantages.data if lfi.advantages else [0.0] * seq_len)
             all_model_ids.append(model_id)
             all_loss_fns.append(request_data.loss_fn)
             all_loss_fn_configs.append(request_data.loss_fn_config)

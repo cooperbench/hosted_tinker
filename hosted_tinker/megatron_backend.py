@@ -3,8 +3,9 @@
 Uses Megatron-Core for distributed training with tensor parallelism.
 Runs as a torchrun subprocess with multiple workers.
 
-Key advantage over PEFT: proper tensor parallelism with all_reduce
-(works on B200 where FSDP hangs).
+Supports both H100 and B200 GPUs:
+- H100: NCCL P2P works, standard collectives
+- B200: NCCL P2P disabled, Gloo group for object collectives
 
 Usage:
     python -m hosted_tinker.api --base-model Qwen/Qwen3-30B-A3B \
@@ -27,6 +28,23 @@ from hosted_tinker.backend import AbstractBackend
 from hosted_tinker import types
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_gpu_type() -> str:
+    """Detect GPU type via nvidia-smi. Returns 'H100', 'B200', 'A100', or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            name = result.stdout.strip().split("\n")[0].upper()
+            for family in ("H100", "B200", "A100"):
+                if family in name:
+                    return family
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "unknown"
 
 
 class MegatronBackendConfig(BaseModel, extra="forbid"):
@@ -100,8 +118,17 @@ class MegatronBackend(AbstractBackend):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         env["HF_HUB_OFFLINE"] = "1"
+        # GCP VMs set NCCL_NET=gIB for multi-node clusters but
+        # libibverbs.so is not installed on single-node VMs
         env["NCCL_NET_PLUGIN"] = ""
         env.pop("NCCL_NET", None)
+        # B200 GPUs need NCCL P2P disabled (pytorch#165727)
+        # H100/A100 GPUs work fine with P2P enabled
+        gpu_type = _detect_gpu_type()
+        if gpu_type == "B200":
+            env["NCCL_P2P_DISABLE"] = "1"
+        else:
+            env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching Megatron workers on GPUs {gpu_ids} (port {master_port})")
 

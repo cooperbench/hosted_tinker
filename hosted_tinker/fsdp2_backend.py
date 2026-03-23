@@ -87,6 +87,15 @@ class FSDP2Backend(AbstractBackend):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         env["HF_HUB_OFFLINE"] = "1"
+        # GCP VMs set NCCL_NET=gIB for multi-node clusters
+        env["NCCL_NET_PLUGIN"] = ""
+        env.pop("NCCL_NET", None)
+        # B200 GPUs need NCCL P2P disabled; H100/A100 work fine
+        from hosted_tinker.megatron_backend import _detect_gpu_type
+        if _detect_gpu_type() == "B200":
+            env["NCCL_P2P_DISABLE"] = "1"
+        else:
+            env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching FSDP2 workers on GPUs {gpu_ids} (port {master_port})")
 

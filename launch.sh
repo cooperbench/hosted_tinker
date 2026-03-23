@@ -2,26 +2,50 @@
 # Preemption-robust launch script for hosted-tinker on GCP spot VMs.
 #
 # Features:
+# - Supports both H100 (a3-highgpu-8g) and B200 (a4-highgpu-8g) GPUs
 # - Retries VM creation across multiple zones if preempted
 # - Auto-deploys code and dependencies
 # - Resumes from checkpoint if available
 # - Monitors and restarts on crash
 #
 # Usage:
-#   bash launch.sh                    # Create new spot VM + launch
-#   bash launch.sh --vm tinker-bench  # Use existing VM
-#   bash launch.sh --monitor          # Just monitor existing deployment
+#   GPU_TYPE=h100 bash launch.sh                    # H100 spot VM
+#   GPU_TYPE=b200 bash launch.sh                    # B200 spot VM (default)
+#   bash launch.sh --vm tinker-bench                # Use existing VM
+#   bash launch.sh --monitor                        # Just monitor existing deployment
 
 set -euo pipefail
+
+# ============================================================
+# GPU type configuration
+# ============================================================
+GPU_TYPE="${GPU_TYPE:-b200}"  # "h100" or "b200"
+
+case "$GPU_TYPE" in
+    h100|H100)
+        DEFAULT_MACHINE="a3-highgpu-8g"
+        DEFAULT_IMAGE="common-cu128-ubuntu-2204-nvidia-570-v20260305"
+        NCCL_P2P_DISABLE_FLAG=""
+        ;;
+    b200|B200)
+        DEFAULT_MACHINE="a4-highgpu-8g"
+        DEFAULT_IMAGE="common-cu128-ubuntu-2204-nvidia-570-v20260305"
+        NCCL_P2P_DISABLE_FLAG="export NCCL_P2P_DISABLE=1"
+        ;;
+    *)
+        echo "Unknown GPU_TYPE: $GPU_TYPE. Use 'h100' or 'b200'."
+        exit 1
+        ;;
+esac
 
 # ============================================================
 # Configuration
 # ============================================================
 VM_NAME="${VM_NAME:-tinker-train}"
 PROJECT="${PROJECT:-soe-gemini-llm-agents}"
-MACHINE_TYPE="${MACHINE_TYPE:-a4-highgpu-8g}"  # 8× B200
+MACHINE_TYPE="${MACHINE_TYPE:-$DEFAULT_MACHINE}"
 BOOT_DISK_SIZE="${BOOT_DISK_SIZE:-500GB}"
-IMAGE="${IMAGE:-common-cu128-ubuntu-2204-nvidia-570-v20260305}"
+IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
 IMAGE_PROJECT="${IMAGE_PROJECT:-deeplearning-platform-release}"
 
 # Zones to try (ordered by preference)
@@ -72,7 +96,7 @@ find_or_create_vm() {
 
     # Create new spot VM
     for zone in $ZONES; do
-        log "Trying to create $vm_name in $zone..."
+        log "Trying to create $vm_name in $zone ($MACHINE_TYPE)..."
         if gcloud compute instances create "$vm_name" \
             --zone="$zone" \
             --machine-type="$MACHINE_TYPE" \
@@ -143,7 +167,7 @@ echo "Deploy complete"
 launch_server() {
     local vm="$1" zone="$2"
 
-    log "Launching hosted-tinker on $vm ($zone)..."
+    log "Launching hosted-tinker on $vm ($zone) [GPU: $GPU_TYPE]..."
     gcloud compute ssh "$vm" --zone="$zone" --quiet --command="
 set -euo pipefail
 export PATH=\"\$HOME/.local/bin:\$PATH\"
@@ -157,8 +181,9 @@ rm -f /home/hao/hosted-tinker/hosted_tinker/tinker.db*
 
 cd /home/hao/SkyRL
 export PYTHONPATH='/home/hao/hosted-tinker:\${PYTHONPATH:-}'
-export NCCL_P2P_DISABLE=1 NCCL_NET_PLUGIN=''
+export NCCL_NET_PLUGIN=''
 unset NCCL_NET 2>/dev/null || true
+$NCCL_P2P_DISABLE_FLAG
 
 # Symlink build tools if needed
 sudo ln -sf \$HOME/miniforge3/bin/ninja /usr/local/bin/ninja 2>/dev/null || true
@@ -224,6 +249,7 @@ monitor_loop() {
         log "Server running at http://$ip:8000"
         log "  Training: http://$ip:8000/api/v1/healthz"
         log "  Inference: http://$ip:8000/v1/models"
+        log "  Dashboard: http://$ip:8000/dashboard"
         log "  SSH: gcloud compute ssh $vm --zone=$zone -- -L 8000:localhost:8000"
 
         # Monitor (check every 2 min)
@@ -250,6 +276,8 @@ monitor_loop() {
 # ============================================================
 # Main
 # ============================================================
+log "GPU type: $GPU_TYPE ($MACHINE_TYPE)"
+
 case "${1:-}" in
     --monitor)
         log "Monitoring $VM_NAME..."

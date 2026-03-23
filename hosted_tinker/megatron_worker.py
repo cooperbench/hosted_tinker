@@ -1,10 +1,11 @@
 """Megatron worker process for distributed training.
 
 Uses PyTorch DDP (not FSDP) with HuggingFace model + PEFT LoRA.
-DDP uses all_reduce for gradient sync which works on B200 GPUs
-(unlike FSDP which hangs on gather_object).
+Each GPU holds a full copy of the model with manual gradient all_reduce.
 
-Each GPU holds a full copy of the model. LoRA params are synced via DDP.
+Supports both H100 and B200 GPUs:
+- H100: Uses NCCL for all collectives (broadcast_object_list, etc.)
+- B200: Uses Gloo group for object collectives (NCCL hangs on Blackwell)
 """
 from __future__ import annotations
 
@@ -56,9 +57,11 @@ def main():
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
 
-    # Create a Gloo group for object-based collectives (broadcast_object_list, etc.)
-    # NCCL's implementation of these hangs on B200 Blackwell GPUs.
-    gloo_group = dist.new_group(backend="gloo")
+    # On B200 Blackwell GPUs, NCCL object collectives (broadcast_object_list,
+    # gather_object) hang due to P2P bug (pytorch#165727). Use Gloo as fallback.
+    # On H100/A100, NCCL works fine — use default process group.
+    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
 
     if rank == 0:
         logger.info(f"Megatron worker: {world_size} GPUs, model={args.base_model}, lora_rank={args.lora_rank}")
@@ -83,11 +86,10 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    # NOTE: DDP doesn't work with MoE (unused experts cause issues):
-    # - find_unused_parameters=True: uses broadcast which hangs on B200
+    # NOTE: DDP wrapper doesn't work with MoE models (unused experts cause issues):
+    # - find_unused_parameters=True: uses broadcast which hangs on B200 (works on H100)
     # - find_unused_parameters=False: OOM trying to broadcast MoE expert buffers
-    # Instead, use manual gradient all_reduce after backward pass.
-    # model stays unwrapped (no DDP).
+    # Using manual gradient all_reduce works on both H100 and B200.
 
     # Optimizer
     lora_params = [p for p in model.parameters() if p.requires_grad]
@@ -111,7 +113,7 @@ def main():
                 cmd_data[0] = pickle.load(f)
             os.unlink(args.cmd_file)
 
-        dist.broadcast_object_list(cmd_data, src=0, group=gloo_group)
+        dist.broadcast_object_list(cmd_data, src=0, group=obj_group)
         cmd = cmd_data[0]
 
         if cmd["type"] == "shutdown":
@@ -171,11 +173,10 @@ def main():
 
                 del out, target_lp
 
-            # Gather results to rank 0 via Gloo all_gather_object
-            # (NCCL object collectives hang on B200 Blackwell, use Gloo group instead)
+            # Gather results to rank 0
             my_result = {i: (all_lp[i], all_loss[i]) for i in range(my_start, my_end) if all_lp[i] is not None}
             gathered = [None] * world_size
-            dist.all_gather_object(gathered, my_result, group=gloo_group)
+            dist.all_gather_object(gathered, my_result, group=obj_group)
 
             if rank == 0:
                 merged_lp = [None] * n_examples
@@ -230,9 +231,8 @@ def main():
                 with open(args.result_file, "wb") as f:
                     pickle.dump({"saved": True}, f)
 
-        # NOTE: skip dist.barrier() — it intermittently hangs on B200.
-        # The broadcast_object_list at the top of each loop iteration
-        # provides sufficient synchronization.
+        # Skip dist.barrier() — broadcast_object_list at the top of each
+        # loop iteration provides sufficient synchronization.
 
     dist.destroy_process_group()
 

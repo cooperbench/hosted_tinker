@@ -1,7 +1,11 @@
 """FSDP2 worker process for distributed training.
 
-Launched via torchrun by FSDP2Backend. All ranks participate in NCCL collectives.
-Rank 0 receives commands via multiprocessing.Queue and broadcasts to other ranks.
+Launched via torchrun by FSDP2Backend. All ranks participate in collectives.
+Rank 0 receives commands via file-based IPC and broadcasts to other ranks.
+
+Supports H100 and B200 GPUs:
+- H100: Uses NCCL for all collectives (broadcast_object_list, gather_object)
+- B200: Uses Gloo group for object collectives (NCCL hangs on Blackwell)
 
 Usage (internal, called by FSDP2Backend):
     torchrun --nproc_per_node=N hosted_tinker/fsdp2_worker.py \
@@ -90,6 +94,11 @@ def main():
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
+    # On B200, NCCL object collectives hang (pytorch#165727). Use Gloo fallback.
+    # On H100/A100, NCCL works fine — use default process group.
+    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
+
     if rank == 0:
         logger.info(f"FSDP2 worker: {world_size} GPUs, model={args.base_model}, rank={args.lora_rank}")
 
@@ -172,7 +181,7 @@ def main():
             os.unlink(args.cmd_file)
 
         # Broadcast command to all ranks
-        dist.broadcast_object_list(cmd_data, src=0)
+        dist.broadcast_object_list(cmd_data, src=0, group=obj_group)
         cmd = cmd_data[0]
         cmd_type = cmd["type"]
 
@@ -250,6 +259,7 @@ def main():
                 {i: (all_logprobs[i], all_losses[i]) for i in range(my_start, my_end)},
                 gathered if rank == 0 else None,
                 dst=0,
+                group=obj_group,
             )
 
             if rank == 0:

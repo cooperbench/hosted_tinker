@@ -26,6 +26,16 @@ A standalone, self-hosted implementation of the [Tinker](https://tinker-docs.thi
 > - TP max = 2 (Qwen3.5 has only 2 KV heads)
 > - *Multi-GPU TP blocked on B200 by NCCL bug; works on H100 or single GPU
 
+## Supported GPUs
+
+| GPU | NCCL P2P | FSDP2 | DDP | Megatron TP | Notes |
+|---|---|---|---|---|---|
+| **H100** (80GB) | Works | ✅ | ✅ | ✅ | All backends work out of the box |
+| **B200** (192GB) | Disabled* | ✅ | ✅ | ✅ | Auto-detects, uses Gloo for object collectives |
+| **A100** (80GB) | Works | ✅ | ✅ | ✅ | All backends work |
+
+> *B200 has a known NCCL P2P bug ([pytorch#165727](https://github.com/pytorch/pytorch/issues/165727)). `NCCL_P2P_DISABLE=1` is set automatically when B200 is detected.
+
 ## Quick Start
 
 ```bash
@@ -51,6 +61,12 @@ python -m hosted_tinker.api \
     --base-model Qwen/Qwen3-30B-A3B \
     --backend megatron_tp \
     --backend-config '{"n_train_gpus": 4, "mode": "tp"}'
+
+# Launch on GCP spot VM (H100)
+GPU_TYPE=h100 bash launch.sh
+
+# Launch on GCP spot VM (B200, default)
+GPU_TYPE=b200 bash launch.sh
 ```
 
 ## Client Usage
@@ -230,22 +246,21 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 - LoRA training: ✅ (30.3M trainable params)
 - Full test suite: Not yet run (same VM preemption issues)
 
-## B200 NCCL Workaround
+## GPU-Specific NCCL Handling
 
 NVIDIA B200 GPUs have a known NCCL bug ([pytorch#165727](https://github.com/pytorch/pytorch/issues/165727), [nccl#1999](https://github.com/nvidia/nccl/issues/1999)) where `broadcast_object_list` and `gather_object` hang.
 
-**Workaround**: Use a separate Gloo process group for object-based collectives:
+**Auto-detection**: The backend auto-detects GPU type via `nvidia-smi` and applies the appropriate workaround:
+
+- **H100/A100**: NCCL P2P enabled, standard collectives — no workaround needed
+- **B200**: Sets `NCCL_P2P_DISABLE=1`, creates Gloo process group for object collectives
 
 ```python
-gloo_group = dist.new_group(backend="gloo")
-dist.broadcast_object_list(data, src=0, group=gloo_group)  # Works!
-dist.all_reduce(tensor)  # NCCL tensor ops work fine
-```
-
-Required environment variables:
-```bash
-export NCCL_P2P_DISABLE=1
-export NCCL_NET_PLUGIN=""
+# Workers automatically use Gloo on B200, NCCL on H100
+_use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+obj_group = dist.new_group(backend="gloo") if _use_gloo else None
+dist.broadcast_object_list(data, src=0, group=obj_group)
+dist.all_reduce(tensor)  # NCCL tensor ops work fine on all GPUs
 ```
 
 ## Architecture

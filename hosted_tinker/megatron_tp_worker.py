@@ -40,8 +40,10 @@ def main():
     torch.cuda.set_device(rank)
     device = f"cuda:{rank}"
 
-    # Create Gloo group for object collectives (NCCL broadcast_object_list hangs on B200)
-    gloo_group = dist.new_group(backend="gloo")
+    # On B200, NCCL object collectives hang (pytorch#165727). Use Gloo fallback.
+    # On H100/A100, NCCL works fine — use default process group.
+    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
 
     if rank == 0:
         logger.info(f"Megatron TP worker: {world_size} GPUs, model={args.base_model}")
@@ -139,8 +141,7 @@ def main():
                 cmd_data[0] = pickle.load(f)
             os.unlink(args.cmd_file)
 
-        # Use Gloo for object broadcast (NCCL hangs on B200)
-        dist.broadcast_object_list(cmd_data, src=0, group=gloo_group)
+        dist.broadcast_object_list(cmd_data, src=0, group=obj_group)
         cmd = cmd_data[0]
 
         if cmd["type"] == "shutdown":

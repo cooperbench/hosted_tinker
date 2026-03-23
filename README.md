@@ -204,50 +204,60 @@ Tinker API is faster for long generation (500 tokens) due to optimized batching.
 
 PEFT backend, 2× H100 80GB train + 2× H100 vLLM (TP=2):
 
-#### forward (logprob computation, no gradients)
+#### forward (logprob computation)
 
-| Seq Length | H100 Self-Hosted | Official Tinker | Ratio |
-|---|---|---|---|
-| 512 | **0.5s** | 6.2s | **12.7× faster** |
-| 1,024 | **0.5s** | 4.7s | **9.5× faster** |
-| 4,096 | **1.2s** | 5.7s | **4.9× faster** |
-| 8,192 | **2.1s** | 4.7s | **2.2× faster** |
-| 16,384 | **4.1s** | 4.8s | **1.2× faster** |
-| 32,768 | 11.2s | **10.4s** | 0.93× |
+| Seq Length | H100 Self-Hosted | Official Tinker | Ratio | H100 tok/s |
+|---|---|---|---|---|
+| 512 | **1.0s** | 8.5s | **8.6× faster** | 518 |
+| 1,024 | **1.1s** | 11.4s | **10.4× faster** | 939 |
+| 4,096 | **1.8s** | 9.1s | **5.0× faster** | 2,235 |
+| 8,192 | **2.6s** | 7.1s | **2.7× faster** | 3,145 |
+| 16,384 | **4.6s** | 12.7s | **2.7× faster** | 3,532 |
+| 32,768 | 11.7s | **9.1s** | 0.78× | 2,802 |
 
 #### forward_backward (training step with gradients)
 
-| Seq Length | H100 Self-Hosted | Official Tinker | Ratio |
-|---|---|---|---|
-| 512 | **0.5s** | 4.1s | **8.3× faster** |
-| 1,024 | **0.6s** | 4.0s | **6.6× faster** |
-| 4,096 | **1.2s** | 4.2s | **3.6× faster** |
-| 8,192 | **2.1s** | 4.4s | **2.1× faster** |
-| 16,384 | **4.1s** | 5.2s | **1.3× faster** |
-| 32,768 | 11.2s | **8.3s** | 0.74× |
+| Seq Length | H100 Self-Hosted | Official Tinker | Ratio | H100 tok/s |
+|---|---|---|---|---|
+| 512 | **0.6s** | 4.4s | **7.3× faster** | 849 |
+| 1,024 | **0.6s** | 5.2s | **8.6× faster** | 1,694 |
+| 4,096 | **1.2s** | 4.2s | **3.6× faster** | 3,476 |
+| 8,192 | **2.1s** | 9.0s | **4.2× faster** | 3,864 |
+| 16,384 | **4.1s** | 8.2s | **2.0× faster** | 3,952 |
+| **32,768** | 11.2s | **7.4s** | 0.66× | 2,924 |
 
 #### optim_step (weight update)
 
 | After Seq | H100 Self-Hosted | Official Tinker | Ratio |
 |---|---|---|---|
-| 512 | **0.5s** | 3.5s | **7.1× faster** |
-| 4,096 | **0.5s** | 4.0s | **8.2× faster** |
+| 512 | **0.5s** | 3.6s | **7.5× faster** |
+| 4,096 | **0.5s** | 4.6s | **9.3× faster** |
 | 16,384 | **0.5s** | 3.6s | **7.3× faster** |
-| 32,768 | **0.5s** | 4.3s | **8.9× faster** |
+| 32,768 | **0.5s** | 4.0s | **8.2× faster** |
 
 #### Inference (chat completions via vLLM TP=2)
 
-| Prompt | Max Tokens | H100 Self-Hosted |
-|---|---|---|
-| Short | 20 | 1.4s |
-| Medium | 100 | 7.0s |
-| Long | 500 | 35.3s |
-| Very Long | 2048 | 143.5s |
+| Prompt | Max Tokens | H100 Self-Hosted | Official Tinker |
+|---|---|---|---|
+| Short | 20 | 1.4s | N/A* |
+| Medium | 100 | 6.9s | N/A* |
+| Long | 500 | 34.4s | N/A* |
+| Very Long | 2048 | 140.2s | N/A* |
 
-**Key finding**: H100 self-hosted is **2–13× faster** than official Tinker API for sequences
-up to 16K. Official Tinker has ~3.5s fixed overhead per API call (network + queueing), which
-dominates at short sequences. At 32K, Tinker's cloud infrastructure is slightly faster due
-to more GPUs. optim_step is **7–9× faster** consistently (0.5s vs 3.5–4.3s).
+*Official Tinker sampling endpoint returns 404 for this model.
+
+#### Other API operations
+
+| Operation | H100 Self-Hosted | Official Tinker |
+|---|---|---|
+| create_lora_training_client | 0.8s | 19.1s |
+
+**Key findings (H100)**:
+- Self-hosted is **3–10× faster** for sequences up to 16K due to zero network overhead
+- Official Tinker has ~4–9s fixed overhead per API call (network + queueing + cold start)
+- At 32K, Tinker's cloud GPUs are faster (likely more/larger GPUs)
+- `optim_step` is consistently **7–9× faster** self-hosted (0.5s vs 3.6–4.6s)
+- `create_lora_training_client` is **24× faster** (0.8s vs 19.1s — model already loaded)
 
 ### Qwen3-30B-A3B: B200 Training with vLLM inference
 

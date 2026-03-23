@@ -235,16 +235,14 @@ PEFT backend, 2× H100 80GB train + 2× H100 vLLM (TP=2):
 | 16,384 | **0.5s** | 3.6s | **7.3× faster** |
 | 32,768 | **0.5s** | 4.0s | **8.2× faster** |
 
-#### Inference (chat completions via vLLM TP=2)
+#### Inference (chat completions)
 
-| Prompt | Max Tokens | H100 Self-Hosted | Official Tinker |
-|---|---|---|---|
-| Short | 20 | 1.4s | N/A* |
-| Medium | 100 | 6.9s | N/A* |
-| Long | 500 | 34.4s | N/A* |
-| Very Long | 2048 | 140.2s | N/A* |
-
-*Official Tinker sampling endpoint returns 404 for this model.
+| Prompt | Max Tokens | H100 (vLLM TP=2) | Official Tinker | Ratio |
+|---|---|---|---|---|
+| Short | 20 | **1.4s** | 3.6s | **2.6× faster** |
+| Medium | 100 | 6.9s | **6.2s** | 0.89× |
+| Long | 500 | **34.7s** | 47.4s | **1.4× faster** |
+| Very Long | 2048 | 142.5s | **115.2s** | 0.81× |
 
 #### Other API operations
 
@@ -253,11 +251,12 @@ PEFT backend, 2× H100 80GB train + 2× H100 vLLM (TP=2):
 | create_lora_training_client | 0.8s | 19.1s |
 
 **Key findings (H100)**:
-- Self-hosted is **3–10× faster** for sequences up to 16K due to zero network overhead
+- Training is **3–10× faster** for sequences up to 16K due to zero network overhead
 - Official Tinker has ~4–9s fixed overhead per API call (network + queueing + cold start)
 - At 32K, Tinker's cloud GPUs are faster (likely more/larger GPUs)
 - `optim_step` is consistently **7–9× faster** self-hosted (0.5s vs 3.6–4.6s)
 - `create_lora_training_client` is **24× faster** (0.8s vs 19.1s — model already loaded)
+- Inference: **2.6× faster for short prompts** (1.4s vs 3.6s), Tinker faster for long generation (2048 tok: 115s vs 143s)
 
 ### Qwen3-30B-A3B: B200 Training with vLLM inference
 

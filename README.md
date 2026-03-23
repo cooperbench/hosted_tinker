@@ -200,40 +200,40 @@ Qwen3.5-35B-A3B sampling/generation:
 Self-hosted vLLM is **2.3× faster for short prompts** (lower latency) but the official
 Tinker API is faster for long generation (500 tokens) due to optimized batching.
 
-### Qwen3-30B-A3B on H100 (4× H100 80GB)
+### Qwen3-30B-A3B on H100: Self-Hosted vs Official Tinker API
 
-PEFT backend, 2× H100 train + 2× H100 vLLM (TP=2):
+PEFT backend, 2× H100 80GB train + 2× H100 vLLM (TP=2):
 
 #### forward (logprob computation, no gradients)
 
-| Seq Length | H100 Self-Hosted | tok/s |
-|---|---|---|
-| 512 | 0.3s | 1,950 |
-| 1,024 | 0.2s | 4,790 |
-| 4,096 | 0.4s | 9,685 |
-| 8,192 | 0.7s | 11,063 |
-| 16,384 | 1.4s | 11,839 |
-| **32,768** | **3.2s** | 10,237 |
+| Seq Length | H100 Self-Hosted | Official Tinker | Ratio |
+|---|---|---|---|
+| 512 | **0.5s** | 6.2s | **12.7× faster** |
+| 1,024 | **0.5s** | 4.7s | **9.5× faster** |
+| 4,096 | **1.2s** | 5.7s | **4.9× faster** |
+| 8,192 | **2.1s** | 4.7s | **2.2× faster** |
+| 16,384 | **4.1s** | 4.8s | **1.2× faster** |
+| 32,768 | 11.2s | **10.4s** | 0.93× |
 
 #### forward_backward (training step with gradients)
 
-| Seq Length | H100 Self-Hosted | tok/s |
-|---|---|---|
-| 512 | 0.6s | 848 |
-| 1,024 | 0.7s | 1,428 |
-| 4,096 | 1.2s | 3,477 |
-| 8,192 | 2.1s | 3,865 |
-| 16,384 | 4.1s | 3,950 |
-| **32,768** | **11.2s** | 2,923 |
+| Seq Length | H100 Self-Hosted | Official Tinker | Ratio |
+|---|---|---|---|
+| 512 | **0.5s** | 4.1s | **8.3× faster** |
+| 1,024 | **0.6s** | 4.0s | **6.6× faster** |
+| 4,096 | **1.2s** | 4.2s | **3.6× faster** |
+| 8,192 | **2.1s** | 4.4s | **2.1× faster** |
+| 16,384 | **4.1s** | 5.2s | **1.3× faster** |
+| 32,768 | 11.2s | **8.3s** | 0.74× |
 
 #### optim_step (weight update)
 
-| After Seq | H100 Self-Hosted |
-|---|---|
-| 512 | 0.4s |
-| 4,096 | 0.5s |
-| 16,384 | 0.5s |
-| 32,768 | 0.4s |
+| After Seq | H100 Self-Hosted | Official Tinker | Ratio |
+|---|---|---|---|
+| 512 | **0.5s** | 3.5s | **7.1× faster** |
+| 4,096 | **0.5s** | 4.0s | **8.2× faster** |
+| 16,384 | **0.5s** | 3.6s | **7.3× faster** |
+| 32,768 | **0.5s** | 4.3s | **8.9× faster** |
 
 #### Inference (chat completions via vLLM TP=2)
 
@@ -241,23 +241,13 @@ PEFT backend, 2× H100 train + 2× H100 vLLM (TP=2):
 |---|---|---|
 | Short | 20 | 1.4s |
 | Medium | 100 | 7.0s |
-| Long | 500 | 34.9s |
-| Very Long | 2048 | 143.2s |
+| Long | 500 | 35.3s |
+| Very Long | 2048 | 143.5s |
 
-### Qwen3-30B-A3B: B200 vs H100 Comparison
-
-| Operation | Seq Length | B200 (4 GPU) | H100 (2 GPU) | Notes |
-|---|---|---|---|---|
-| forward | 32,768 | 2.2s | 3.2s | B200 faster (4 GPU pipeline vs 2 GPU) |
-| forward_backward | 512 | 0.7s | 0.6s | Similar |
-| forward_backward | 8,192 | 1.4s | 2.1s | B200 faster (more GPUs) |
-| forward_backward | 32,768 | 9.2s | 11.2s | B200 faster (more GPUs) |
-| optim_step | any | 0.1–0.5s | 0.4–0.5s | Similar |
-| Inference (Short) | 20 tok | 1.4s | 1.4s | Identical |
-| Inference (Long) | 500 tok | 33.3s | 35.1s | Similar |
-
-> Note: B200 benchmarks used 4 GPUs for training vs 2 GPUs on H100,
-> so per-GPU efficiency is comparable. H100 uses standard NCCL (no P2P workaround needed).
+**Key finding**: H100 self-hosted is **2–13× faster** than official Tinker API for sequences
+up to 16K. Official Tinker has ~3.5s fixed overhead per API call (network + queueing), which
+dominates at short sequences. At 32K, Tinker's cloud infrastructure is slightly faster due
+to more GPUs. optim_step is **7–9× faster** consistently (0.5s vs 3.5–4.3s).
 
 ### Qwen3-30B-A3B: B200 Training with vLLM inference
 

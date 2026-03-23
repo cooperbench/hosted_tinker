@@ -63,7 +63,7 @@ LORA_RANK="${LORA_RANK:-32}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_TAR="/tmp/hosted_tinker_deploy.tar.gz"
 
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
+log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 # ============================================================
 # Step 1: Find or create VM

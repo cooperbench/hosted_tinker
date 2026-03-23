@@ -241,7 +241,8 @@ PEFT backend, 2× H100 train + 2× H100 vLLM (TP=2):
 |---|---|---|
 | Short | 20 | 1.4s |
 | Medium | 100 | 7.0s |
-| Long | 500 | 35.1s |
+| Long | 500 | 34.9s |
+| Very Long | 2048 | 143.2s |
 
 ### Qwen3-30B-A3B: B200 vs H100 Comparison
 

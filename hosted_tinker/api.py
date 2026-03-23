@@ -36,6 +36,7 @@ from hosted_tinker.db_models import (
 from hosted_tinker.extra import ExternalInferenceClient
 from hosted_tinker._storage import download_file
 from hosted_tinker._log import logger, get_uvicorn_log_config
+from hosted_tinker.dashboard import router as dashboard_router, record_request
 
 # Validation patterns for train_run_ids, model_ids and checkpoint_ids
 ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -158,6 +159,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Tinker API", version="0.0.1", lifespan=lifespan)
+app.include_router(dashboard_router)
+
+
+@app.middleware("http")
+async def track_requests(request: Request, call_next):
+    """Record request metrics for the dashboard."""
+    start = time.time()
+    response = await call_next(request)
+    latency = time.time() - start
+    endpoint = request.url.path
+    if endpoint != "/dashboard":
+        record_request(endpoint, latency, response.status_code)
+    return response
 
 
 async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:

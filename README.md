@@ -200,7 +200,65 @@ Qwen3.5-35B-A3B sampling/generation:
 Self-hosted vLLM is **2.3× faster for short prompts** (lower latency) but the official
 Tinker API is faster for long generation (500 tokens) due to optimized batching.
 
-### Qwen3-30B-A3B: Training with vLLM inference
+### Qwen3-30B-A3B on H100 (4× H100 80GB)
+
+PEFT backend, 2× H100 train + 2× H100 vLLM (TP=2):
+
+#### forward (logprob computation, no gradients)
+
+| Seq Length | H100 Self-Hosted | tok/s |
+|---|---|---|
+| 512 | 0.3s | 1,950 |
+| 1,024 | 0.2s | 4,790 |
+| 4,096 | 0.4s | 9,685 |
+| 8,192 | 0.7s | 11,063 |
+| 16,384 | 1.4s | 11,839 |
+| **32,768** | **3.2s** | 10,237 |
+
+#### forward_backward (training step with gradients)
+
+| Seq Length | H100 Self-Hosted | tok/s |
+|---|---|---|
+| 512 | 0.6s | 848 |
+| 1,024 | 0.7s | 1,428 |
+| 4,096 | 1.2s | 3,477 |
+| 8,192 | 2.1s | 3,865 |
+| 16,384 | 4.1s | 3,950 |
+| **32,768** | **11.2s** | 2,923 |
+
+#### optim_step (weight update)
+
+| After Seq | H100 Self-Hosted |
+|---|---|
+| 512 | 0.4s |
+| 4,096 | 0.5s |
+| 16,384 | 0.5s |
+| 32,768 | 0.4s |
+
+#### Inference (chat completions via vLLM TP=2)
+
+| Prompt | Max Tokens | H100 Self-Hosted |
+|---|---|---|
+| Short | 20 | 1.4s |
+| Medium | 100 | 7.0s |
+| Long | 500 | 35.1s |
+
+### Qwen3-30B-A3B: B200 vs H100 Comparison
+
+| Operation | Seq Length | B200 (4 GPU) | H100 (2 GPU) | Notes |
+|---|---|---|---|---|
+| forward | 32,768 | 2.2s | 3.2s | B200 faster (4 GPU pipeline vs 2 GPU) |
+| forward_backward | 512 | 0.7s | 0.6s | Similar |
+| forward_backward | 8,192 | 1.4s | 2.1s | B200 faster (more GPUs) |
+| forward_backward | 32,768 | 9.2s | 11.2s | B200 faster (more GPUs) |
+| optim_step | any | 0.1–0.5s | 0.4–0.5s | Similar |
+| Inference (Short) | 20 tok | 1.4s | 1.4s | Identical |
+| Inference (Long) | 500 tok | 33.3s | 35.1s | Similar |
+
+> Note: B200 benchmarks used 4 GPUs for training vs 2 GPUs on H100,
+> so per-GPU efficiency is comparable. H100 uses standard NCCL (no P2P workaround needed).
+
+### Qwen3-30B-A3B: B200 Training with vLLM inference
 
 PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 

@@ -116,6 +116,66 @@ client = OpenAI(base_url="http://<EXTERNAL_IP>:8000/v1", api_key="not-needed")
 
 > Note: External IP changes on each spot VM restart. The `launch.sh` script prints the current IP.
 
+## Running Tinker Cookbook Examples
+
+The [tinker-cookbook](https://github.com/thinking-machines-lab/tinker-cookbook) recipes work
+out of the box with hosted-tinker — just point `base_url` at your server.
+
+### Step 1: Launch hosted-tinker (from your local machine)
+
+```bash
+# 8×B200 (or use GPU_TYPE=h100 for H100)
+cd hosted-tinker
+GPU_TYPE=b200 TRAIN_GPUS=0,1,2,3 VLLM_GPUS=4,5,6,7 VLLM_TP=4 bash launch.sh
+
+# Or launch on an existing VM
+GPU_TYPE=b200 bash launch.sh --vm <vm-name>
+```
+
+Wait for `Server running at http://<IP>:8000`.
+
+### Step 2: Install tinker-cookbook
+
+```bash
+git clone https://github.com/thinking-machines-lab/tinker-cookbook.git
+cd tinker-cookbook
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e '.[math-rl]'
+```
+
+### Step 3: Run recipes
+
+```bash
+export TINKER_API_KEY=tml-not-needed
+export SERVER=http://<IP>:8000
+
+# SFT on No Robots dataset (Qwen3-30B-A3B)
+.venv/bin/python -m tinker_cookbook.recipes.sl_loop \
+    base_url=$SERVER model_name=Qwen/Qwen3-30B-A3B
+
+# RL on GSM8K math reasoning (GRPO)
+.venv/bin/python -m tinker_cookbook.recipes.rl_loop \
+    base_url=$SERVER model_name=Qwen/Qwen3-30B-A3B
+
+# Full SFT with evaluation and checkpointing
+.venv/bin/python -m tinker_cookbook.recipes.sl_basic \
+    base_url=$SERVER model_name=Qwen/Qwen3-30B-A3B
+
+# Full RL with evaluation
+.venv/bin/python -m tinker_cookbook.recipes.rl_basic \
+    base_url=$SERVER model_name=Qwen/Qwen3-30B-A3B
+```
+
+### Verified Results
+
+SFT (`sl_loop`) on 8×B200 with Qwen3-30B-A3B:
+- 74 training steps, batch_size=128
+- NLL: 2.5 → 1.78
+- ~50s per step
+- Checkpointing works (save_state + save_weights_for_sampler)
+
+> Note: Recipes use `key=value` syntax (not `--key value`) — this is the `chz` config framework.
+
 ## Backends
 
 ### PEFT (default)

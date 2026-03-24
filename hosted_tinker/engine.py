@@ -517,6 +517,7 @@ class TinkerEngine:
 
         checkpoint_id = request_data.path
         output_path = self.config.checkpoints_base / model_id / f"{checkpoint_id}.tar.gz"
+        Path(str(output_path)).parent.mkdir(parents=True, exist_ok=True)
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.TRAINING):
             self.backend.save_checkpoint(output_path, model_id)
@@ -536,6 +537,7 @@ class TinkerEngine:
 
         checkpoint_id = Path(request_data.path).name
         output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+        Path(str(output_path)).parent.mkdir(parents=True, exist_ok=True)
 
         persist = request_data.sampling_session_seq_id is None
 

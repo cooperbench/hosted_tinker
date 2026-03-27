@@ -88,6 +88,9 @@ def main():
     args = parser.parse_args()
 
     # Initialize distributed
+    # GCP NCCL shim (a4/B200) requires TORCH_NCCL_ASYNC_ERROR_HANDLING to be unset;
+    # torchrun always injects it — remove it before initializing NCCL.
+    os.environ.pop("TORCH_NCCL_ASYNC_ERROR_HANDLING", None)
     from datetime import timedelta
     dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
     rank = dist.get_rank()
@@ -96,10 +99,10 @@ def main():
     torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
-    # On B200, NCCL object collectives hang (pytorch#165727). Use Gloo fallback.
-    # On H100/A100, NCCL works fine — use default process group.
-    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
-    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
+    # Always use Gloo for object collectives (broadcast_object_list, gather_object).
+    # Keeps NCCL exclusively for tensor ops (FSDP all-gather/reduce-scatter).
+    # Avoids NCCL crashes on B200/GCP with Python object serialization.
+    obj_group = dist.new_group(backend="gloo")
 
     if rank == 0:
         logger.info(f"FSDP2 worker: {world_size} GPUs, model={args.base_model}, rank={args.lora_rank}")
@@ -108,6 +111,7 @@ def main():
     start = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        attn_implementation="sdpa",
     )
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
@@ -220,11 +224,21 @@ def main():
             my_indices = sorted_indices[rank::world_size]
             my_indices.sort(key=lambda i: len(all_input_ids[i]))
 
-            # Process in micro-batches for higher GPU utilization
-            for mb_start in range(0, len(my_indices), micro_batch_size):
-                mb_indices = my_indices[mb_start:mb_start + micro_batch_size]
-                seqs = [all_input_ids[i] for i in mb_indices]
-                max_len = max(len(s) for s in seqs)
+            # Process in micro-batches for higher GPU utilization.
+            # FSDP requires ALL ranks to call model() together (NCCL all-gather).
+            # When n_examples < world_size some ranks have empty my_indices — use a
+            # single dummy micro-batch for those ranks so FSDP collectives don't deadlock.
+            mb_schedule = list(range(0, len(my_indices), micro_batch_size)) or [None]
+            for mb_start in mb_schedule:
+                is_dummy = mb_start is None
+                if is_dummy:
+                    mb_indices = []
+                    seqs = [[pad_id]]  # 1-token dummy keeps FSDP happy
+                    max_len = 1
+                else:
+                    mb_indices = my_indices[mb_start:mb_start + micro_batch_size]
+                    seqs = [all_input_ids[i] for i in mb_indices]
+                    max_len = max(len(s) for s in seqs)
 
                 input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
                 attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
@@ -237,6 +251,10 @@ def main():
                 else:
                     with torch.no_grad():
                         out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+
+                if is_dummy:
+                    del out, input_ids
+                    continue
 
                 log_probs = F.log_softmax(out.logits, dim=-1)
                 del out
@@ -255,7 +273,7 @@ def main():
                         adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
                         loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
                         loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                        all_losses[idx] = -(target_lp * wt).detach().float().cpu().tolist()
+                        all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
                         total_loss = loss_j if total_loss is None else total_loss + loss_j
                     else:
                         all_losses[idx] = [0.0] * seq_len

@@ -668,6 +668,21 @@ async def healthz():
     return HealthResponse(status="ok")
 
 
+class SetMicroBatchSizeRequest(BaseModel):
+    n: int
+
+
+@app.post("/admin/set_micro_batch_size")
+async def set_micro_batch_size(request: SetMicroBatchSizeRequest):
+    """Set FSDP2 micro_batch_size for subsequent forward/forward_backward calls (no restart needed)."""
+    try:
+        with open("/dev/shm/hosted_tinker_mbs", "w") as f:
+            f.write(str(request.n))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write mbs file: {e}")
+    return {"ok": True, "micro_batch_size": request.n}
+
+
 @app.post("/api/v1/create_session", response_model=CreateSessionResponse)
 async def create_session(request: CreateSessionRequest, session: AsyncSession = Depends(get_session)):
     """Create a new session + persist in DB"""

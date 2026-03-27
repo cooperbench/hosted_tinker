@@ -50,6 +50,8 @@ class FSDP2Backend(AbstractBackend):
         self._models: dict[str, types.ModelMetadata] = {}
         self._worker_process: subprocess.Popen | None = None
         self._adapter_counter = 0
+        self._micro_batch_size = config.micro_batch_size
+        self._mbs_file = "/dev/shm/hosted_tinker_mbs"
 
         # IPC files
         self._ipc_dir = tempfile.mkdtemp(prefix="fsdp2_ipc_")
@@ -133,6 +135,23 @@ class FSDP2Backend(AbstractBackend):
         )
         self._adapter_counter += 1
 
+    def set_micro_batch_size(self, n: int) -> None:
+        self._micro_batch_size = n
+        try:
+            with open(self._mbs_file, "w") as f:
+                f.write(str(n))
+        except Exception:
+            pass
+
+    def _refresh_micro_batch_size(self) -> None:
+        """Pick up changes written by the admin endpoint."""
+        try:
+            if os.path.exists(self._mbs_file):
+                with open(self._mbs_file) as f:
+                    self._micro_batch_size = int(f.read().strip())
+        except Exception:
+            pass
+
     def _send_command(self, cmd: dict) -> None:
         """Write command pickle for rank 0 to read."""
         with open(self._cmd_file, "wb") as f:
@@ -169,6 +188,7 @@ class FSDP2Backend(AbstractBackend):
         compute_gradients: bool,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         cmd_type = "forward_backward" if compute_gradients else "forward"
+        self._refresh_micro_batch_size()
 
         # Serialize batch as dict (Pydantic model -> dict for pickle)
         batch_dict = {
@@ -181,7 +201,8 @@ class FSDP2Backend(AbstractBackend):
             "all_loss_fn_configs": prepared_batch.all_loss_fn_configs,
         }
 
-        self._send_command({"type": cmd_type, "batch": batch_dict})
+        self._send_command({"type": cmd_type, "batch": batch_dict,
+                            "micro_batch_size": self._micro_batch_size})
 
         # Wait for result (long timeout for large batches)
         n_examples = len(prepared_batch.all_input_ids)

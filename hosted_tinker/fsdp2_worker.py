@@ -212,6 +212,8 @@ def main():
             else:
                 model.eval()
 
+            micro_batch_size = cmd.get("micro_batch_size", args.micro_batch_size)
+
             # Interleave indices across ranks so each rank gets a mix of short and
             # long sequences, balancing total token count per rank.
             sorted_indices = sorted(range(n_examples), key=lambda i: len(all_input_ids[i]))
@@ -219,8 +221,8 @@ def main():
             my_indices.sort(key=lambda i: len(all_input_ids[i]))
 
             # Process in micro-batches for higher GPU utilization
-            for mb_start in range(0, len(my_indices), args.micro_batch_size):
-                mb_indices = my_indices[mb_start:mb_start + args.micro_batch_size]
+            for mb_start in range(0, len(my_indices), micro_batch_size):
+                mb_indices = my_indices[mb_start:mb_start + micro_batch_size]
                 seqs = [all_input_ids[i] for i in mb_indices]
                 max_len = max(len(s) for s in seqs)
 

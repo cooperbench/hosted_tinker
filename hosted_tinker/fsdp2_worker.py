@@ -83,6 +83,8 @@ def main():
     parser.add_argument("--cmd-file", required=True, help="Path to command pickle file")
     parser.add_argument("--result-file", required=True, help="Path to result pickle file")
     parser.add_argument("--lora-sync-dir", default="/dev/shm/lora_adapters")
+    parser.add_argument("--micro-batch-size", type=int, default=1,
+                        help="Number of sequences per GPU forward pass")
     args = parser.parse_args()
 
     # Initialize distributed
@@ -201,12 +203,6 @@ def main():
             all_loss_configs = batch["all_loss_fn_configs"]
             n_examples = len(all_input_ids)
 
-            # Split examples across ranks (data parallelism)
-            examples_per_rank = (n_examples + world_size - 1) // world_size
-            my_start = rank * examples_per_rank
-            my_end = min(my_start + examples_per_rank, n_examples)
-            my_n = my_end - my_start
-
             all_logprobs = [None] * n_examples
             all_losses = [None] * n_examples
 
@@ -216,39 +212,58 @@ def main():
             else:
                 model.eval()
 
-            # Process my examples
-            for idx in range(my_start, my_end):
-                input_ids = torch.tensor([all_input_ids[idx]], dtype=torch.long, device=device)
-                attn_mask = torch.ones_like(input_ids)
-                target_ids = torch.tensor([all_targets[idx][:len(all_input_ids[idx])]], dtype=torch.long, device=device)
-                weights = torch.tensor([all_weights[idx][:len(all_input_ids[idx])]], dtype=torch.bfloat16, device=device)
-                slp = torch.tensor([all_slp[idx][:len(all_input_ids[idx])]], dtype=torch.bfloat16, device=device)
-                adv = torch.tensor([all_adv[idx][:len(all_input_ids[idx])]], dtype=torch.bfloat16, device=device)
+            # Interleave indices across ranks so each rank gets a mix of short and
+            # long sequences, balancing total token count per rank.
+            sorted_indices = sorted(range(n_examples), key=lambda i: len(all_input_ids[i]))
+            my_indices = sorted_indices[rank::world_size]
+            my_indices.sort(key=lambda i: len(all_input_ids[i]))
+
+            # Process in micro-batches for higher GPU utilization
+            for mb_start in range(0, len(my_indices), args.micro_batch_size):
+                mb_indices = my_indices[mb_start:mb_start + args.micro_batch_size]
+                seqs = [all_input_ids[i] for i in mb_indices]
+                max_len = max(len(s) for s in seqs)
+
+                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+                attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
+                for j, seq in enumerate(seqs):
+                    input_ids[j, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                    attn_mask[j, :len(seq)] = 1
 
                 if compute_grad:
-                    outputs = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+                    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
                 else:
                     with torch.no_grad():
-                        outputs = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
 
-                logits = outputs.logits
-                log_probs = F.log_softmax(logits, dim=-1)
-                target_lp = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-                del logits, log_probs
+                log_probs = F.log_softmax(out.logits, dim=-1)
+                del out
 
-                lp_cpu = target_lp[0].detach().float().cpu().tolist()
-                all_logprobs[idx] = lp_cpu
+                total_loss = None
+                for j, idx in enumerate(mb_indices):
+                    seq_len = len(all_input_ids[idx])
+                    tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
+                    target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                if compute_grad:
-                    loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
-                    loss = loss_fn(target_lp[0], weights[0], slp[0], adv[0], all_loss_configs[idx])
-                    elem_loss = -(target_lp[0] * weights[0]).detach().float().cpu().tolist()
-                    all_losses[idx] = elem_loss
-                    (loss / world_size).backward()  # Scale by world_size for FSDP averaging
-                else:
-                    all_losses[idx] = [0.0] * len(all_input_ids[idx])
+                    all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
 
-                del outputs, target_lp, input_ids
+                    if compute_grad:
+                        wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        slp_t = torch.tensor(all_slp[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
+                        loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
+                        all_losses[idx] = -(target_lp * wt).detach().float().cpu().tolist()
+                        total_loss = loss_j if total_loss is None else total_loss + loss_j
+                    else:
+                        all_losses[idx] = [0.0] * seq_len
+
+                del log_probs, input_ids
+
+                if compute_grad and total_loss is not None:
+                    # Divide by world_size: FSDP sums (not averages) grads across ranks,
+                    # so pre-scale the loss to produce the correct average gradient.
+                    (total_loss / world_size).backward()
 
             if compute_grad:
                 accum_count += 1
@@ -256,7 +271,7 @@ def main():
             # Gather all logprobs to rank 0
             gathered = [None] * world_size
             dist.gather_object(
-                {i: (all_logprobs[i], all_losses[i]) for i in range(my_start, my_end)},
+                {i: (all_logprobs[i], all_losses[i]) for i in my_indices if all_logprobs[i] is not None},
                 gathered if rank == 0 else None,
                 dst=0,
                 group=obj_group,

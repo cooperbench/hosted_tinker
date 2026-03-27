@@ -33,6 +33,7 @@ class FSDP2BackendConfig(BaseModel, extra="forbid"):
     train_gpu_offset: int = Field(default=2, description="First GPU index for training (skip vLLM GPUs)")
     gradient_checkpointing: bool = Field(default=True, description="Enable gradient checkpointing")
     loss_chunk_size: int = Field(default=1024, description="Chunk size for logprob computation")
+    micro_batch_size: int = Field(default=1, description="Sequences per GPU forward pass (higher = better utilization but more memory)")
     # vLLM LoRA sync
     vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync")
     lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir for LoRA weight sync")
@@ -82,6 +83,7 @@ class FSDP2Backend(AbstractBackend):
         ]
         if self.config.gradient_checkpointing:
             cmd.append("--gradient-checkpointing")
+        cmd += ["--micro-batch-size", str(self.config.micro_batch_size)]
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)

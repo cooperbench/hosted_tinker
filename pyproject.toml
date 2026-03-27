@@ -19,6 +19,7 @@ dependencies = [
     "psycopg2-binary",
     "httpx",
     "psutil",
+    "requests>=2.32.5",
 ]
 
 [project.optional-dependencies]

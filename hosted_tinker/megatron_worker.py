@@ -10,6 +10,7 @@ Supports both H100 and B200 GPUs:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import pickle
@@ -48,6 +49,8 @@ def main():
     parser.add_argument("--cmd-file", required=True)
     parser.add_argument("--result-file", required=True)
     parser.add_argument("--lora-sync-dir", default="/dev/shm/lora_adapters")
+    parser.add_argument("--micro-batch-size", type=int, default=4,
+                        help="Number of sequences per GPU forward pass (higher = better GPU utilization)")
     args = parser.parse_args()
 
     from datetime import timedelta
@@ -61,7 +64,7 @@ def main():
     # gather_object) hang due to P2P bug (pytorch#165727). Use Gloo as fallback.
     # On H100/A100, NCCL works fine — use default process group.
     _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
-    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
+    obj_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=86400)) if _use_gloo else None
 
     if rank == 0:
         logger.info(f"Megatron worker: {world_size} GPUs, model={args.base_model}, lora_rank={args.lora_rank}")
@@ -124,11 +127,6 @@ def main():
             batch = cmd["batch"]
             n_examples = len(batch["all_input_ids"])
 
-            # Split examples across ranks (data parallelism)
-            per_rank = (n_examples + world_size - 1) // world_size
-            my_start = rank * per_rank
-            my_end = min(my_start + per_rank, n_examples)
-
             all_lp = [None] * n_examples
             all_loss = [None] * n_examples
 
@@ -138,43 +136,63 @@ def main():
             else:
                 model.eval()
 
-            for idx in range(my_start, my_end):
-                ids = torch.tensor([batch["all_input_ids"][idx]], dtype=torch.long, device=device)
-                tgt = torch.tensor([batch["all_targets"][idx][:len(batch["all_input_ids"][idx])]],
-                                   dtype=torch.long, device=device)
-                wt = torch.tensor([batch["all_token_weights"][idx][:len(batch["all_input_ids"][idx])]],
-                                  dtype=torch.bfloat16, device=device)
-                slp = torch.tensor([batch["all_sampling_logprobs"][idx][:len(batch["all_input_ids"][idx])]],
-                                   dtype=torch.bfloat16, device=device)
-                adv = torch.tensor([batch["all_advantages"][idx][:len(batch["all_input_ids"][idx])]],
-                                   dtype=torch.bfloat16, device=device)
+            # Interleave indices across ranks so each rank gets a mix of
+            # short and long sequences, balancing total token count per rank.
+            # Sort by length first so interleaving is maximally balanced.
+            sorted_indices = sorted(range(n_examples), key=lambda i: len(batch["all_input_ids"][i]))
+            my_indices = sorted_indices[rank::world_size]  # interleaved assignment
+            # Sort this rank's indices by length so micro-batches have similar
+            # lengths, minimizing padding waste within each micro-batch.
+            my_indices.sort(key=lambda i: len(batch["all_input_ids"][i]))
+
+            # Process in micro-batches for higher GPU utilization
+            for mb_start in range(0, len(my_indices), args.micro_batch_size):
+                mb_indices = my_indices[mb_start:mb_start + args.micro_batch_size]
+                seqs = [batch["all_input_ids"][i] for i in mb_indices]
+                max_len = max(len(s) for s in seqs)
+
+                # Pad sequences to max_len in this micro-batch
+                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+                attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
+                for j, seq in enumerate(seqs):
+                    input_ids[j, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                    attn_mask[j, :len(seq)] = 1
 
                 if compute_grad:
-                    out = model(input_ids=ids, use_cache=False)
+                    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
                 else:
                     with torch.no_grad():
-                        out = model(input_ids=ids, use_cache=False)
+                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
 
-                logits = out.logits
+                logits = out.logits  # [B, max_len, vocab]
                 log_probs = F.log_softmax(logits, dim=-1)
-                target_lp = log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-                del logits, log_probs
+                del logits, out
 
-                all_lp[idx] = target_lp[0].detach().float().cpu().tolist()
+                total_loss = None
+                for j, idx in enumerate(mb_indices):
+                    seq_len = len(batch["all_input_ids"][idx])
+                    tgt = torch.tensor(batch["all_targets"][idx][:seq_len], dtype=torch.long, device=device)
+                    target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                if compute_grad:
-                    loss_fn = LOSS_FN.get(batch["all_loss_fns"][idx], ce_loss)
-                    loss = loss_fn(target_lp[0], wt[0], slp[0], adv[0], batch["all_loss_fn_configs"][idx])
-                    all_loss[idx] = [0.0] * len(batch["all_input_ids"][idx])
-                    loss.backward()
-                    accum_count += 1
-                else:
-                    all_loss[idx] = [0.0] * len(batch["all_input_ids"][idx])
+                    all_lp[idx] = target_lp.detach().float().cpu().tolist()
+                    all_loss[idx] = [0.0] * seq_len
 
-                del out, target_lp
+                    if compute_grad:
+                        wt = torch.tensor(batch["all_token_weights"][idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        slp = torch.tensor(batch["all_sampling_logprobs"][idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        adv = torch.tensor(batch["all_advantages"][idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        loss_fn = LOSS_FN.get(batch["all_loss_fns"][idx], ce_loss)
+                        loss_j = loss_fn(target_lp, wt, slp, adv, batch["all_loss_fn_configs"][idx])
+                        total_loss = loss_j if total_loss is None else total_loss + loss_j
+
+                del log_probs
+
+                if compute_grad and total_loss is not None:
+                    total_loss.backward()
+                    accum_count += len(mb_indices)
 
             # Gather results to rank 0
-            my_result = {i: (all_lp[i], all_loss[i]) for i in range(my_start, my_end) if all_lp[i] is not None}
+            my_result = {i: (all_lp[i], all_loss[i]) for i in my_indices if all_lp[i] is not None}
             gathered = [None] * world_size
             dist.all_gather_object(gathered, my_result, group=obj_group)
 
@@ -216,7 +234,33 @@ def main():
                               if "lora_" in k or "modules_to_save" in k}
                 save_dir = os.path.join(args.lora_sync_dir, "adapter")
                 os.makedirs(save_dir, exist_ok=True)
-                save_file(lora_state, os.path.join(save_dir, "adapter_model.safetensors"))
+                # vLLM doesn't support fused QKV (in_proj_qkv) LoRA; filter those out
+                # so vLLM can load the remaining (MLP + split-attn) LoRA weights.
+                _vllm_unsupported = {"in_proj_qkv", "out_proj"}
+                vllm_state = {k: v for k, v in lora_state.items()
+                              if not any(f".{m}." in k for m in _vllm_unsupported)}
+                save_file(vllm_state, os.path.join(save_dir, "adapter_model.safetensors"))
+                # Save adapter_config.json so vLLM can load the adapter
+                peft_cfg = list(model.peft_config.values())[0]
+                vllm_targets = sorted(
+                    m for m in (peft_cfg.target_modules or []) if m not in _vllm_unsupported
+                )
+                adapter_cfg = {
+                    "base_model_name_or_path": args.base_model,
+                    "bias": peft_cfg.bias,
+                    "fan_in_fan_out": False,
+                    "inference_mode": True,
+                    "init_lora_weights": True,
+                    "lora_alpha": peft_cfg.lora_alpha,
+                    "lora_dropout": peft_cfg.lora_dropout,
+                    "modules_to_save": None,
+                    "peft_type": "LORA",
+                    "r": peft_cfg.r,
+                    "target_modules": vllm_targets,
+                    "task_type": "CAUSAL_LM",
+                }
+                with open(os.path.join(save_dir, "adapter_config.json"), "w") as cf:
+                    json.dump(adapter_cfg, cf)
 
                 with open(args.result_file, "wb") as f:
                     pickle.dump({"grad_norm": grad_norm, "lora_path": save_dir}, f)

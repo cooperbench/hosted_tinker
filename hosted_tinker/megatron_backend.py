@@ -110,6 +110,7 @@ class MegatronBackend(AbstractBackend):
             "--cmd-file", self._cmd_file,
             "--result-file", self._result_file,
             "--lora-sync-dir", self.config.lora_sync_dir,
+            "--micro-batch-size", str(self.config.micro_batch_size),
         ]
         if self.config.gradient_checkpointing:
             cmd.append("--gradient-checkpointing")
@@ -159,6 +160,23 @@ class MegatronBackend(AbstractBackend):
             lora_config=lora_config,
         )
         self._adapter_counter += 1
+
+        # Save initial (random) LoRA weights and sync to vLLM so inference is available
+        # before the first rollout. Uses a zero-lr optim step to trigger the worker's
+        # LoRA save path without changing any weights.
+        if self.config.vllm_sync_url:
+            logger.info("Syncing initial LoRA weights to vLLM...")
+            self._send_command({
+                "type": "optim_step",
+                "adam_params": {
+                    "learning_rate": 0.0, "beta1": 0.9, "beta2": 0.95,
+                    "eps": 1e-8, "weight_decay": 0.0,
+                },
+            })
+            init_result = self._read_result(timeout=300)
+            if "lora_path" in init_result:
+                self._sync_lora_to_vllm(model_id, init_result["lora_path"])
+                logger.info("Initial LoRA synced to vLLM")
 
     def _send_command(self, cmd: dict) -> None:
         with open(self._cmd_file, "wb") as f:

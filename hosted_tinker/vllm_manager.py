@@ -69,6 +69,15 @@ class VLLMManager:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self.gpu_ids)
         env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        # B200 NCCL fix: strip gib/GIB transport library that causes hangs on B200
+        raw_ldpath = env.get("LD_LIBRARY_PATH", "")
+        fixed_ldpath = ":".join(
+            p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p
+        )
+        env["LD_LIBRARY_PATH"] = fixed_ldpath
+        env["NCCL_NET"] = "Socket"
+        env["NCCL_P2P_DISABLE"] = "1"
+        env["NCCL_IB_DISABLE"] = "1"
 
         log_path = f"vllm_server_{self.port}.log"
         self._log_file = open(log_path, "w")

@@ -329,6 +329,18 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
 | forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
 
+### FSDP2 Backend: Micro-Batch Throughput on B200 (Qwen3.5-35B-A3B)
+
+4× B200 GPUs, 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), max 32K tokens:
+
+| micro_batch_size | forward tok/s | GPU util (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) |
+|---|---|---|---|---|
+| **1** | 23,500 | 64% | 2,500 | 77% |
+| **2** | **27,000** | **74%** | **2,600** | **86%** |
+| 4+ | OOM | — | OOM | — |
+
+> mbs=2 is optimal: +15% forward throughput, +4% fwd+bwd vs mbs=1. mbs=4+ OOMs (backward needs ~44 GiB; model+activations consume 150+ GiB of B200's 178 GiB).
+
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
 | Backend | Memory/GPU | Parallelism | Max Batch for 32K |

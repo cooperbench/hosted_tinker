@@ -34,6 +34,7 @@ class FSDP2BackendConfig(BaseModel, extra="forbid"):
     gradient_checkpointing: bool = Field(default=True, description="Enable gradient checkpointing")
     loss_chunk_size: int = Field(default=1024, description="Chunk size for logprob computation")
     micro_batch_size: int = Field(default=1, description="Sequences per GPU forward pass (higher = better utilization but more memory)")
+    remove_padding: bool = Field(default=False, description="Concatenate sequences into flat tensor instead of padding; requires flash_attn")
     # vLLM LoRA sync
     vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync")
     lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir for LoRA weight sync")
@@ -85,6 +86,8 @@ class FSDP2Backend(AbstractBackend):
         ]
         if self.config.gradient_checkpointing:
             cmd.append("--gradient-checkpointing")
+        if self.config.remove_padding:
+            cmd.append("--remove-padding")
         cmd += ["--micro-batch-size", str(self.config.micro_batch_size)]
 
         env = os.environ.copy()

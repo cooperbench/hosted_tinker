@@ -43,7 +43,8 @@ _SLOTS = [
 
 
 def make_backend_config(backend: str, n_train_gpus: int, gpu_offset: int,
-                        micro_batch_size: int, gradient_checkpointing: bool) -> dict:
+                        micro_batch_size: int, gradient_checkpointing: bool,
+                        remove_padding: bool = False) -> dict:
     cfg = {
         "n_train_gpus": n_train_gpus,
         "train_gpu_offset": gpu_offset,
@@ -52,6 +53,8 @@ def make_backend_config(backend: str, n_train_gpus: int, gpu_offset: int,
     }
     if backend == "megatron_local":
         cfg["mode"] = "ddp"
+    if backend == "fsdp2" and remove_padding:
+        cfg["remove_padding"] = True
     return cfg
 
 
@@ -190,6 +193,7 @@ def run_slot(
     n_repeat: int,
     server_start_timeout: int,
     out: dict,
+    remove_padding: bool = False,
 ) -> None:
     gpu_offset = slot["gpu_offset"]
     gpu_ids = slot["gpu_ids"]
@@ -197,7 +201,8 @@ def run_slot(
     url = f"http://localhost:{port}"
     first_mbs = mbs_list[0]
     backend_config = make_backend_config(backend, n_train_gpus, gpu_offset,
-                                         first_mbs, gradient_checkpointing)
+                                         first_mbs, gradient_checkpointing,
+                                         remove_padding=remove_padding)
     label = f"{backend} gpus={gpu_ids[0]}-{gpu_ids[-1]}"
 
     print(f"\n[{label}] Starting server (mbs={first_mbs}, gc={'on' if gradient_checkpointing else 'off'})...")
@@ -279,6 +284,8 @@ def main():
     parser.add_argument("--server-start-timeout", type=int, default=900)
     parser.add_argument("--subsample", type=int, default=0,
                         help="Pick N evenly-spaced examples from generated dataset (0=use all)")
+    parser.add_argument("--remove-padding", action="store_true", default=False,
+                        help="Enable remove_padding for FSDP2 backend (requires flash_attn)")
     args = parser.parse_args()
 
     backends = [b.strip() for b in args.backends.split(",")]
@@ -314,7 +321,7 @@ def main():
                 args=(slot, backend, mbs_list, args.base_model, args.lora_rank,
                       args.n_train_gpus, backend_gc(backend),
                       data, seq_lens, args.warmup, args.repeat,
-                      args.server_start_timeout, out),
+                      args.server_start_timeout, out, args.remove_padding),
                 daemon=True,
             )
             threads.append(t)

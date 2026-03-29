@@ -88,6 +88,11 @@ def main():
     args = parser.parse_args()
 
     # Initialize distributed
+    # Set CUDA device BEFORE init_process_group — on B200 with 8 ranks, NCCL init
+    # can restrict device visibility, causing set_device(7) to fail afterwards.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = f"cuda:{local_rank}"
     # GCP NCCL shim (a4/B200) requires TORCH_NCCL_ASYNC_ERROR_HANDLING to be unset;
     # torchrun always injects it — remove it before initializing NCCL.
     os.environ.pop("TORCH_NCCL_ASYNC_ERROR_HANDLING", None)
@@ -95,9 +100,6 @@ def main():
     dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
 
     # Always use Gloo for object collectives (broadcast_object_list, gather_object).
     # Keeps NCCL exclusively for tensor ops (FSDP all-gather/reduce-scatter).

@@ -1,180 +1,334 @@
-"""Benchmark PEFT vs FSDP2 backend latency and throughput.
+"""Unified backend throughput benchmark: FSDP2 vs Megatron DDP.
 
-Measures forward_backward + optim_step latency at various sequence lengths
-for both backends.
+Sweeps backend × micro_batch_size, running two configs in parallel
+across two GPU halves (0-3 and 4-7). No server restart between mbs
+values for the same backend.
 
 Usage:
-    # Benchmark PEFT backend (must be running on port 8000):
-    python benchmarks/bench_backends.py --backend pytorch --url http://localhost:8000
+    python benchmarks/bench_backends.py \\
+        --base-model Qwen/Qwen3.5-35B-A3B \\
+        --backends megatron_local,fsdp2 \\
+        --micro-batch-sizes 1,2
 
-    # Benchmark FSDP2 backend (must be running on port 8000):
-    python benchmarks/bench_backends.py --backend fsdp2 --url http://localhost:8000
-
-    # Compare two running servers:
-    python benchmarks/bench_backends.py --compare \
-        --url-a http://localhost:8000 --label-a PEFT \
-        --url-b http://localhost:8001 --label-b FSDP2
+    # Single backend sweep only:
+    python benchmarks/bench_backends.py \\
+        --backends megatron_local \\
+        --micro-batch-sizes 1,2,4
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import signal
+import subprocess
+import sys
+import threading
 import time
 
 import numpy as np
+import requests
 
 os.environ.setdefault("TINKER_API_KEY", "tml-dummy")
+
+sys.path.insert(0, os.path.dirname(__file__))
+from bench_gpu_throughput import make_mixed_data, GpuPoller, run_pass
+
 import tinker
 
-
-def make_datum(seq_len: int, seed: int = 42) -> tinker.Datum:
-    """Create a cross_entropy training datum with random tokens."""
-    rng = np.random.RandomState(seed)
-    tokens = rng.randint(100, 150000, size=seq_len).tolist()
-    target_tokens = tokens[1:] + [0]
-    train_start = seq_len // 2
-    weights = [0.0] * train_start + [1.0] * (seq_len - train_start)
-    zeros = [0.0] * seq_len
-    return tinker.Datum(
-        model_input=tinker.ModelInput(chunks=[tinker.EncodedTextChunk(tokens=tokens)]),
-        loss_fn_inputs={
-            "target_tokens": tinker.TensorData(data=target_tokens, dtype="int64"),
-            "weights": tinker.TensorData(data=weights, dtype="float32"),
-            "logprobs": tinker.TensorData(data=zeros, dtype="float32"),
-            "advantages": tinker.TensorData(data=zeros, dtype="float32"),
-        },
-    )
+_SLOTS = [
+    {"gpu_offset": 0, "gpu_ids": [0, 1, 2, 3], "port": 8771},
+    {"gpu_offset": 4, "gpu_ids": [4, 5, 6, 7], "port": 8772},
+]
 
 
-def benchmark_server(
-    base_url: str,
-    model_name: str,
+def make_backend_config(backend: str, n_train_gpus: int, gpu_offset: int,
+                        micro_batch_size: int, gradient_checkpointing: bool) -> dict:
+    cfg = {
+        "n_train_gpus": n_train_gpus,
+        "train_gpu_offset": gpu_offset,
+        "micro_batch_size": micro_batch_size,
+        "gradient_checkpointing": gradient_checkpointing,
+    }
+    if backend == "megatron_local":
+        cfg["mode"] = "ddp"
+    return cfg
+
+
+def wait_server_ready(url: str, timeout: int = 600) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{url}/api/v1/healthz", timeout=5)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
+def start_server(base_model: str, backend: str, backend_config: dict, port: int) -> subprocess.Popen:
+    db_path = f"/tmp/tinker_bench_{port}.db"
+    # Remove stale DB from previous runs to avoid engine processing old requests
+    try:
+        os.remove(db_path)
+        os.remove(db_path + "-shm")
+        os.remove(db_path + "-wal")
+    except FileNotFoundError:
+        pass
+    cmd = [
+        sys.executable, "-m", "hosted_tinker.api",
+        "--base-model", base_model,
+        "--backend", backend,
+        "--backend-config", json.dumps(backend_config),
+        "--port", str(port),
+        "--database-url", f"sqlite:///{db_path}",
+    ]
+    env = os.environ.copy()
+    env["HF_HUB_OFFLINE"] = "1"
+    return subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
+
+
+def stop_server(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=30)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def benchmark_mbs_list(
+    url: str,
+    base_model: str,
     lora_rank: int,
-    lengths: list[int],
-    n_warmup: int = 1,
-    n_repeat: int = 3,
-) -> dict[int, dict[str, float]]:
-    """Benchmark a running tinker server.
-
-    Returns:
-        Dict mapping seq_len -> {"fwd_bwd_s": float, "optim_s": float, "total_s": float}
-    """
-    service = tinker.ServiceClient(base_url=base_url)
-    tc = service.create_lora_training_client(base_model=model_name, rank=lora_rank)
-    adam = tinker.AdamParams(learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.0)
-
+    mbs_list: list[int],
+    data,
+    seq_lens: list[int],
+    gpu_ids: list[int],
+    n_warmup: int,
+    n_repeat: int,
+    label_prefix: str,
+) -> dict:
+    """Benchmark multiple mbs values on an already-running server."""
+    service = tinker.ServiceClient(base_url=url)
+    tc = service.create_lora_training_client(base_model=base_model, rank=lora_rank)
+    total_tokens = sum(seq_lens)
+    poller = GpuPoller(gpu_ids)
     results = {}
 
-    for length in lengths:
-        datum = make_datum(length)
-        times_fwd = []
-        times_opt = []
+    for mbs in mbs_list:
+        try:
+            r = requests.post(f"{url}/admin/set_micro_batch_size", json={"n": mbs}, timeout=10)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"  [{label_prefix} mbs={mbs}] WARNING: set_micro_batch_size failed: {e}")
 
-        for i in range(n_warmup + n_repeat):
-            t0 = time.time()
-            try:
-                tc.forward_backward([datum], loss_fn="cross_entropy").result(timeout=1200)
-            except Exception as e:
-                print(f"  FAILED at length={length}: {str(e)[:100]}")
-                results[length] = {"fwd_bwd_s": float("inf"), "optim_s": float("inf"),
-                                   "total_s": float("inf"), "status": "FAILED"}
-                break
-            t_fwd = time.time() - t0
+        label = f"{label_prefix} mbs={mbs}"
+        mbs_results = {}
+        for pass_type in ("forward", "forward_backward"):
+            print(f"  [{label}][{pass_type}] warmup ({n_warmup})...")
+            warmup_ok = True
+            for _ in range(n_warmup):
+                try:
+                    run_pass(tc, data, pass_type)
+                except Exception as e:
+                    print(f"  [{label}][{pass_type}] warmup FAILED: {e}")
+                    mbs_results[pass_type] = None
+                    warmup_ok = False
+                    break
 
-            t1 = time.time()
-            tc.optim_step(adam).result(timeout=120)
-            t_opt = time.time() - t1
+            if not warmup_ok:
+                continue
 
-            if i >= n_warmup:
-                times_fwd.append(t_fwd)
-                times_opt.append(t_opt)
-        else:
-            results[length] = {
-                "fwd_bwd_s": np.mean(times_fwd),
-                "optim_s": np.mean(times_opt),
-                "total_s": np.mean(times_fwd) + np.mean(times_opt),
-                "fwd_bwd_std": np.std(times_fwd),
-                "status": "OK",
-            }
+            elapsed_list, gpu_stats_list = [], []
+            for i in range(n_repeat):
+                print(f"  [{label}][{pass_type}] run {i+1}/{n_repeat}...")
+                try:
+                    poller.start()
+                    elapsed = run_pass(tc, data, pass_type)
+                    poller.stop()
+                    elapsed_list.append(elapsed)
+                    gpu_stats_list.append(poller.summary())
+                    print(f"    elapsed={elapsed:.1f}s  tok/s={total_tokens/elapsed:.0f}  "
+                          f"gpu_util={gpu_stats_list[-1]['mean']:.0f}%  "
+                          f"gpu_mem={gpu_stats_list[-1]['mem_pct_mean']:.0f}%")
+                except Exception as e:
+                    poller.stop()
+                    print(f"  [{label}][{pass_type}] run {i+1} FAILED: {e}")
+                    break
 
+            if elapsed_list:
+                mean_e = np.mean(elapsed_list)
+                mbs_results[pass_type] = {
+                    "elapsed_s": float(mean_e),
+                    "tok_per_s": float(total_tokens / mean_e),
+                    "gpu_util_mean": float(np.mean([s["mean"] for s in gpu_stats_list])),
+                    "gpu_mem_pct_mean": float(np.mean([s["mem_pct_mean"] for s in gpu_stats_list])),
+                }
+            else:
+                mbs_results[pass_type] = None
+
+        results[mbs] = mbs_results
     return results
 
 
-def print_results(label: str, results: dict[int, dict[str, float]]) -> None:
-    """Pretty-print benchmark results."""
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"{'='*60}")
-    print(f"{'Seq Len':>10} {'fwd_bwd':>10} {'optim':>10} {'total':>10} {'tok/s':>10} {'status':>8}")
-    print(f"{'-'*60}")
+def run_slot(
+    slot: dict,
+    backend: str,
+    mbs_list: list[int],
+    base_model: str,
+    lora_rank: int,
+    n_train_gpus: int,
+    gradient_checkpointing: bool,
+    data,
+    seq_lens: list[int],
+    n_warmup: int,
+    n_repeat: int,
+    server_start_timeout: int,
+    out: dict,
+) -> None:
+    gpu_offset = slot["gpu_offset"]
+    gpu_ids = slot["gpu_ids"]
+    port = slot["port"]
+    url = f"http://localhost:{port}"
+    first_mbs = mbs_list[0]
+    backend_config = make_backend_config(backend, n_train_gpus, gpu_offset,
+                                         first_mbs, gradient_checkpointing)
+    label = f"{backend} gpus={gpu_ids[0]}-{gpu_ids[-1]}"
 
-    for length, r in sorted(results.items()):
-        if r["status"] == "OK":
-            tok_per_s = length / r["fwd_bwd_s"] if r["fwd_bwd_s"] > 0 else 0
-            print(f"{length:>10} {r['fwd_bwd_s']:>8.1f}s {r['optim_s']:>8.1f}s "
-                  f"{r['total_s']:>8.1f}s {tok_per_s:>8.0f} {'OK':>8}")
-        else:
-            print(f"{length:>10} {'---':>10} {'---':>10} {'---':>10} {'---':>10} {'FAIL':>8}")
+    print(f"\n[{label}] Starting server (mbs={first_mbs}, gc={'on' if gradient_checkpointing else 'off'})...")
+    proc = start_server(base_model, backend, backend_config, port)
+    try:
+        if not wait_server_ready(url, timeout=server_start_timeout):
+            print(f"  [{label}] ERROR: server not ready")
+            for mbs in mbs_list:
+                out[(backend, mbs)] = None
+            return
+
+        results = benchmark_mbs_list(
+            url=url,
+            base_model=base_model,
+            lora_rank=lora_rank,
+            mbs_list=mbs_list,
+            data=data,
+            seq_lens=seq_lens,
+            gpu_ids=gpu_ids,
+            n_warmup=n_warmup,
+            n_repeat=n_repeat,
+            label_prefix=backend,
+        )
+        for mbs, r in results.items():
+            out[(backend, mbs)] = r
+    except Exception as e:
+        print(f"  [{label}] FAILED: {e}")
+        for mbs in mbs_list:
+            out[(backend, mbs)] = None
+    finally:
+        stop_server(proc)
 
 
-def print_comparison(results_a: dict, results_b: dict, label_a: str, label_b: str) -> None:
-    """Print side-by-side comparison."""
-    print(f"\n{'='*80}")
-    print(f"  Comparison: {label_a} vs {label_b}")
-    print(f"{'='*80}")
-    print(f"{'Seq Len':>10} {'':>3} {label_a+' fwd':>10} {label_b+' fwd':>10} {'Speedup':>10}")
-    print(f"{'-'*80}")
+def print_summary(all_results: dict, n_examples: int, total_tokens: int) -> None:
+    W = 115
+    print(f"\n{'='*W}")
+    print(f"  Backend throughput  |  {n_examples} examples, {total_tokens:,} total tokens")
+    print(f"{'='*W}")
+    print(f"{'backend':>15} {'gpus':>5} {'mbs':>5} | "
+          f"{'fwd tok/s':>11} {'gpu%':>6} {'mem%':>6} | "
+          f"{'fwd+bwd tok/s':>14} {'gpu%':>6} {'mem%':>6}")
+    print(f"{'-'*W}")
 
-    all_lengths = sorted(set(results_a.keys()) | set(results_b.keys()))
-    for length in all_lengths:
-        ra = results_a.get(length, {"fwd_bwd_s": float("inf"), "status": "N/A"})
-        rb = results_b.get(length, {"fwd_bwd_s": float("inf"), "status": "N/A"})
-
-        if ra["status"] == "OK" and rb["status"] == "OK":
-            speedup = ra["fwd_bwd_s"] / rb["fwd_bwd_s"] if rb["fwd_bwd_s"] > 0 else 0
-            print(f"{length:>10} {'':>3} {ra['fwd_bwd_s']:>8.1f}s {rb['fwd_bwd_s']:>8.1f}s "
-                  f"{speedup:>8.2f}x")
-        else:
-            sa = f"{ra['fwd_bwd_s']:.1f}s" if ra["status"] == "OK" else ra["status"]
-            sb = f"{rb['fwd_bwd_s']:.1f}s" if rb["status"] == "OK" else rb["status"]
-            print(f"{length:>10} {'':>3} {sa:>10} {sb:>10} {'---':>10}")
+    for (backend, mbs), r in sorted(all_results.items(), key=lambda x: (x[0][0], x[0][1])):
+        n_gpus = 4
+        if r is None:
+            print(f"{backend:>15} {n_gpus:>5} {mbs:>5}   {'FAILED':>11}")
+            continue
+        fwd = r.get("forward")
+        fwdbwd = r.get("forward_backward")
+        fwd_tps  = f"{fwd['tok_per_s']:>11.0f}"    if fwd    else f"{'OOM':>11}"
+        fwd_gpu  = f"{fwd['gpu_util_mean']:>5.0f}%"  if fwd    else f"{'---':>6}"
+        fwd_mem  = f"{fwd['gpu_mem_pct_mean']:>5.0f}%" if fwd   else f"{'---':>6}"
+        fb_tps   = f"{fwdbwd['tok_per_s']:>14.0f}"  if fwdbwd else f"{'OOM':>14}"
+        fb_gpu   = f"{fwdbwd['gpu_util_mean']:>5.0f}%" if fwdbwd else f"{'---':>6}"
+        fb_mem   = f"{fwdbwd['gpu_mem_pct_mean']:>5.0f}%" if fwdbwd else f"{'---':>6}"
+        print(f"{backend:>15} {n_gpus:>5} {mbs:>5} | {fwd_tps} {fwd_gpu} {fwd_mem} | {fb_tps} {fb_gpu} {fb_mem}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark hosted-tinker backends")
-    parser.add_argument("--url", default="http://localhost:8000")
-    parser.add_argument("--model", default="Qwen/Qwen3.5-35B-A3B")
+    parser = argparse.ArgumentParser(description="Unified backend throughput benchmark")
+    parser.add_argument("--base-model", default="Qwen/Qwen3.5-35B-A3B")
     parser.add_argument("--lora-rank", type=int, default=32)
-    parser.add_argument("--label", default="Backend")
-    parser.add_argument("--lengths", default="1024,4096,8192,16384,32768",
-                        help="Comma-separated sequence lengths")
+    parser.add_argument("--backends", default="megatron_local,fsdp2",
+                        help="Comma-separated: megatron_local,fsdp2")
+    parser.add_argument("--micro-batch-sizes", default="1,2",
+                        help="Comma-separated micro_batch_size values")
+    parser.add_argument("--n-train-gpus", type=int, default=4)
+    parser.add_argument("--gradient-checkpointing", action="store_true", default=False,
+                        help="Enable gradient checkpointing for all backends")
+    parser.add_argument("--gc-backends", default="",
+                        help="Comma-separated backends to enable gc for (overrides --gradient-checkpointing)")
+    parser.add_argument("--n-examples", type=int, default=128)
+    parser.add_argument("--min-seq-len", type=int, default=64)
+    parser.add_argument("--max-seq-len", type=int, default=32768)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
-    # Comparison mode
-    parser.add_argument("--compare", action="store_true")
-    parser.add_argument("--url-a", default=None)
-    parser.add_argument("--url-b", default=None)
-    parser.add_argument("--label-a", default="A")
-    parser.add_argument("--label-b", default="B")
+    parser.add_argument("--server-start-timeout", type=int, default=900)
+    parser.add_argument("--subsample", type=int, default=0,
+                        help="Pick N evenly-spaced examples from generated dataset (0=use all)")
     args = parser.parse_args()
 
-    lengths = [int(x) for x in args.lengths.split(",")]
+    backends = [b.strip() for b in args.backends.split(",")]
+    mbs_list = [int(x) for x in args.micro_batch_sizes.split(",")]
+    gc_backends = set(b.strip() for b in args.gc_backends.split(",") if b.strip())
 
-    if args.compare:
-        assert args.url_a and args.url_b, "Provide --url-a and --url-b for comparison"
-        print(f"Benchmarking {args.label_a} ({args.url_a})...")
-        results_a = benchmark_server(args.url_a, args.model, args.lora_rank, lengths, args.warmup, args.repeat)
-        print_results(args.label_a, results_a)
+    def backend_gc(backend: str) -> bool:
+        if gc_backends:
+            return backend in gc_backends
+        return args.gradient_checkpointing
 
-        print(f"\nBenchmarking {args.label_b} ({args.url_b})...")
-        results_b = benchmark_server(args.url_b, args.model, args.lora_rank, lengths, args.warmup, args.repeat)
-        print_results(args.label_b, results_b)
+    print(f"Generating {args.n_examples} examples (len [{args.min_seq_len}, {args.max_seq_len}])...")
+    data, seq_lens = make_mixed_data(args.n_examples, args.min_seq_len, args.max_seq_len, args.seed)
+    if args.subsample and args.subsample < len(data):
+        idxs = np.round(np.linspace(0, len(data) - 1, args.subsample)).astype(int)
+        data = [data[i] for i in idxs]
+        seq_lens = [seq_lens[i] for i in idxs]
+        print(f"Subsampled to {len(data)} examples")
+    total_tokens = sum(seq_lens)
+    print(f"Total tokens: {total_tokens:,}")
+    gc_str = ", ".join(f"{b}:{'gc=on' if backend_gc(b) else 'gc=off'}" for b in backends)
+    print(f"Backends: {backends}  mbs: {mbs_list}  ({gc_str})")
 
-        print_comparison(results_a, results_b, args.label_a, args.label_b)
-    else:
-        print(f"Benchmarking {args.label} ({args.url})...")
-        results = benchmark_server(args.url, args.model, args.lora_rank, lengths, args.warmup, args.repeat)
-        print_results(args.label, results)
+    all_results: dict = {}
+
+    for i in range(0, len(backends), 2):
+        batch_backends = backends[i:i+2]
+        out: dict = {}
+        threads = []
+        for slot, backend in zip(_SLOTS, batch_backends):
+            t = threading.Thread(
+                target=run_slot,
+                args=(slot, backend, mbs_list, args.base_model, args.lora_rank,
+                      args.n_train_gpus, backend_gc(backend),
+                      data, seq_lens, args.warmup, args.repeat,
+                      args.server_start_timeout, out),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        all_results.update(out)
+        if i + 2 < len(backends):
+            print(f"\n  [batch done — waiting 15s for GPU memory to free]")
+            time.sleep(15)
+
+    print_summary(all_results, len(data), total_tokens)
 
 
 if __name__ == "__main__":

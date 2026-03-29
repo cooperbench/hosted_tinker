@@ -331,47 +331,34 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 
 ### FSDP2 Backend: Micro-Batch Throughput on B200 (Qwen3.5-35B-A3B)
 
-4× B200 GPUs, 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), max 32K tokens:
+4× B200 GPUs, 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), max 32K tokens, gc=on:
 
-| micro_batch_size | forward tok/s | GPU util (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) |
-|---|---|---|---|---|
-| **1** | 23,500 | 64% | 2,500 | 77% |
-| **2** | **27,000** | **74%** | **2,600** | **86%** |
-| 4+ | OOM | — | OOM | — |
+| micro_batch_size | forward tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---|---|---|---|---|---|---|
+| **1** | 23,403 | 64% | 42% | 2,550 | 76% | 54% |
+| **2** | **27,032** | **73%** | **61%** | **2,631** | **87%** | **82%** |
+| 4+ | OOM | — | — | OOM | — | — |
 
-> mbs=2 is optimal: +15% forward throughput, +4% fwd+bwd vs mbs=1. mbs=4+ OOMs (backward needs ~44 GiB; model+activations consume 150+ GiB of B200's 178 GiB).
+> mbs=2 is optimal: +15% forward throughput, +3% fwd+bwd vs mbs=1. mbs=4+ OOMs (backward needs ~44 GiB; model+activations consume 150+ GiB of B200's 178 GiB).
 
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
-128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1.67M total tokens, max_seq_len=32768, lora_rank=32.
+128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1,669,550 total tokens, max_seq_len=32768, lora_rank=32, gc=on.
 Two configs run in parallel across GPU slots 0–3 and 4–7.
 
-#### forward (inference, no gradients)
-
-| backend | GPUs | mbs | tok/s | GPU util |
-|---------|------|-----|-------|----------|
-| FSDP2 | 4 | 1 | 9,127 | 39% |
-| FSDP2 | 4 | 2 | 9,308 | 91% |
-| Megatron DDP | 4 | 1 | 12,867 | 63% |
-| Megatron DDP | 4 | 2 | 14,660 | 73% |
-| **Megatron DDP** | **8** | **1** | **41,667** | **50%** |
-
-#### forward_backward (training step with gradients)
-
-| backend | GPUs | mbs | tok/s | GPU util |
-|---------|------|-----|-------|----------|
-| FSDP2 | 4 | 1 | OOM | — |
-| FSDP2 | 4 | 2 | OOM | — |
-| Megatron DDP | 4 | 1 | 1,438 | 65% |
-| Megatron DDP | 4 | 2 | OOM | — |
-| **Megatron DDP** | **8** | **1** | **5,006** | **57%** |
+| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
+| FSDP2 | 4 | 1 | 23,403 | 64% | 42% | 2,550 | 76% | 54% |
+| FSDP2 | 4 | 2 | **27,032** | 73% | 61% | **2,631** | 87% | 82% |
+| Megatron DDP | 4 | 1 | 23,276 | 56% | 48% | 2,788 | 64% | 59% |
+| Megatron DDP | 4 | 2 | 23,429 | 57% | 66% | **2,798** | 64% | 66% |
 
 **Key findings:**
-- **Megatron DDP 8-GPU mbs=1 is the best config**: 5,006 tok/s fwd+bwd, 3.5× faster than 4-GPU
-- **Megatron DDP forward beats FSDP2** (12,867 vs 9,127 tok/s at 4-GPU) because FSDP2 is bottlenecked by per-layer NCCL all-gathers (39% GPU util vs 63%)
-- **gc=on/off makes no difference** at mbs=1 — only LoRA params need gradients, so activation memory is the binding constraint, not gradient storage
-- **OOM root cause**: logits tensor (mbs × seq_len × vocab = up to 64 GiB) is the bottleneck for mbs≥4; backward at mbs=2 needs 30 GiB extra. Chunked logprob computation would unlock higher mbs
-- **8-GPU forward super-linear scaling** (3.24× with 2× GPUs): fewer sequences per rank → shorter max micro-batch length → less padding waste
+- **gc=on unlocks fwd+bwd for all configs**: FSDP2 fwd+bwd was previously OOM at mbs=1,2; Megatron mbs=2 fwd+bwd was OOM — all now complete
+- **Both backends match on forward** (~23K tok/s at mbs=1) — previous FSDP2 deficit was due to gc=off and different data distribution
+- **FSDP2 mbs=2 has best forward throughput** (27,032 tok/s, +16% vs mbs=1)
+- **Megatron DDP mbs=2 has best fwd+bwd throughput** (2,798 tok/s) with lower memory pressure than FSDP2
+- **OOM root cause**: logits tensor (mbs × seq_len × vocab = up to 64 GiB) is the bottleneck for mbs≥4; gc=on reduces activation memory but logits dominate at large mbs
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

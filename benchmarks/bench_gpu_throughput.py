@@ -89,7 +89,7 @@ class GpuPoller:
         self._thread.join(timeout=5)
 
     def _poll(self):
-        query = "utilization.gpu"
+        query = "utilization.gpu,memory.used,memory.total"
         gpu_arg = ",".join(str(g) for g in self.gpu_ids)
         cmd = [
             "nvidia-smi",
@@ -100,23 +100,34 @@ class GpuPoller:
         while not self._stop.is_set():
             try:
                 out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-                vals = [int(line.strip()) for line in out.strip().splitlines() if line.strip()]
-                if vals:
-                    self._samples.append(vals)
+                lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+                utils, mem_used, mem_total = [], [], []
+                for line in lines:
+                    parts = [p.strip() for p in line.split(",")]
+                    utils.append(int(parts[0]))
+                    mem_used.append(int(parts[1]))
+                    mem_total.append(int(parts[2]))
+                if utils:
+                    self._samples.append({"util": utils, "mem_used": mem_used, "mem_total": mem_total})
             except Exception:
                 pass
             time.sleep(self.interval)
 
     def summary(self) -> dict:
-        """Return mean and max utilization per GPU, and overall mean/max."""
+        """Return mean util%, mem% per GPU, and overall means."""
         if not self._samples:
-            return {"mean": 0, "max": 0, "per_gpu_mean": [], "per_gpu_max": []}
-        arr = np.array(self._samples)  # [T, G]
+            return {"mean": 0, "max": 0, "mem_pct_mean": 0, "per_gpu_mean": [], "per_gpu_max": []}
+        util_arr = np.array([s["util"] for s in self._samples])  # [T, G]
+        mem_pct_arr = np.array([
+            [u / t * 100 for u, t in zip(s["mem_used"], s["mem_total"])]
+            for s in self._samples
+        ])  # [T, G]
         return {
-            "mean": float(arr.mean()),
-            "max": float(arr.max()),
-            "per_gpu_mean": arr.mean(axis=0).tolist(),
-            "per_gpu_max": arr.max(axis=0).tolist(),
+            "mean": float(util_arr.mean()),
+            "max": float(util_arr.max()),
+            "mem_pct_mean": float(mem_pct_arr.mean()),
+            "per_gpu_mean": util_arr.mean(axis=0).tolist(),
+            "per_gpu_max": util_arr.max(axis=0).tolist(),
         }
 
 

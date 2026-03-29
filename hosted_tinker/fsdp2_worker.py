@@ -251,108 +251,54 @@ def main():
                     mb_indices = my_indices[mb_start:mb_start + micro_batch_size]
                     seqs = [all_input_ids[i] for i in mb_indices]
 
-                if args.remove_padding and not is_dummy:
-                    # Packed forward: concatenate sequences into [1, total_tokens]
-                    seq_lens_mb = [len(s) for s in seqs]
-                    flat_ids = []
-                    flat_pos = []
-                    for s in seqs:
-                        flat_ids.extend(s)
-                        flat_pos.extend(range(len(s)))
-                    total_len = len(flat_ids)
+                # Padded forward: right-pad sequences to max_len.
+                # With remove_padding + flash_attention_2, HF internally unpads via
+                # _upad_input and calls flash_attn_varlen_func on real tokens only.
+                max_len = max(len(s) for s in seqs)
+                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+                attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
+                for j, seq in enumerate(seqs):
+                    input_ids[j, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                    attn_mask[j, :len(seq)] = 1
 
-                    input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)
-                    position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)
-                    # attention_mask=None lets HF detect packed format from position_ids
-                    # resets and derive cu_seqlens internally for flash_attn_varlen_func
-
-                    if compute_grad:
-                        out = model(input_ids=input_ids, attention_mask=None,
-                                    position_ids=position_ids, use_cache=False)
-                    else:
-                        with torch.no_grad():
-                            out = model(input_ids=input_ids, attention_mask=None,
-                                        position_ids=position_ids, use_cache=False)
-
-                    log_probs = F.log_softmax(out.logits[0], dim=-1)  # [total_tokens, vocab]
-                    del out
-
-                    # Split packed logits back into per-example results
-                    total_loss = None
-                    offset = 0
-                    for j, idx in enumerate(mb_indices):
-                        sl = seq_lens_mb[j]
-                        lp_slice = log_probs[offset:offset + sl]
-                        tgt = torch.tensor(all_targets[idx][:sl], dtype=torch.long, device=device)
-                        target_lp = lp_slice.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-
-                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
-
-                        if compute_grad:
-                            wt = torch.tensor(all_weights[idx][:sl], dtype=torch.bfloat16, device=device)
-                            slp_t = torch.tensor(all_slp[idx][:sl], dtype=torch.bfloat16, device=device)
-                            adv_t = torch.tensor(all_adv[idx][:sl], dtype=torch.bfloat16, device=device)
-                            loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
-                            loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
-                            total_loss = loss_j if total_loss is None else total_loss + loss_j
-                        else:
-                            all_losses[idx] = [0.0] * sl
-
-                        offset += sl
-
-                    del log_probs, input_ids
-
-                    if compute_grad and total_loss is not None:
-                        (total_loss / world_size).backward()
-
+                if compute_grad:
+                    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
                 else:
-                    # Padded forward: right-pad sequences to max_len
-                    max_len = max(len(s) for s in seqs)
-                    input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-                    attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
-                    for j, seq in enumerate(seqs):
-                        input_ids[j, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                        attn_mask[j, :len(seq)] = 1
+                    with torch.no_grad():
+                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+
+                if is_dummy:
+                    del out, input_ids
+                    continue
+
+                log_probs = F.log_softmax(out.logits, dim=-1)
+                del out
+
+                total_loss = None
+                for j, idx in enumerate(mb_indices):
+                    seq_len = len(all_input_ids[idx])
+                    tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
+                    target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+
+                    all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
 
                     if compute_grad:
-                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+                        wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        slp_t = torch.tensor(all_slp[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                        loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
+                        loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
+                        all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                        total_loss = loss_j if total_loss is None else total_loss + loss_j
                     else:
-                        with torch.no_grad():
-                            out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+                        all_losses[idx] = [0.0] * seq_len
 
-                    if is_dummy:
-                        del out, input_ids
-                        continue
+                del log_probs, input_ids
 
-                    log_probs = F.log_softmax(out.logits, dim=-1)
-                    del out
-
-                    total_loss = None
-                    for j, idx in enumerate(mb_indices):
-                        seq_len = len(all_input_ids[idx])
-                        tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
-                        target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-
-                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
-
-                        if compute_grad:
-                            wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                            slp_t = torch.tensor(all_slp[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                            adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                            loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
-                            loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
-                            total_loss = loss_j if total_loss is None else total_loss + loss_j
-                        else:
-                            all_losses[idx] = [0.0] * seq_len
-
-                    del log_probs, input_ids
-
-                    if compute_grad and total_loss is not None:
-                        # Divide by world_size: FSDP sums (not averages) grads across ranks,
-                        # so pre-scale the loss to produce the correct average gradient.
-                        (total_loss / world_size).backward()
+                if compute_grad and total_loss is not None:
+                    # Divide by world_size: FSDP sums (not averages) grads across ranks,
+                    # so pre-scale the loss to produce the correct average gradient.
+                    (total_loss / world_size).backward()
 
             if compute_grad:
                 accum_count += 1

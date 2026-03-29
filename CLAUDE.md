@@ -4,6 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+### Run the server (FSDP2 backend — recommended for B200)
+```bash
+python -m hosted_tinker.api \
+    --base-model Qwen/Qwen3.5-35B-A3B \
+    --backend fsdp2 \
+    --backend-config '{"n_train_gpus": 4, "train_gpu_offset": 0, "micro_batch_size": 2, "gradient_checkpointing": true}'
+```
+
+### Run the server (Megatron DDP backend)
+```bash
+python -m hosted_tinker.api \
+    --base-model Qwen/Qwen3.5-35B-A3B \
+    --backend megatron_local \
+    --backend-config '{"n_train_gpus": 4, "train_gpu_offset": 0, "micro_batch_size": 2, "gradient_checkpointing": true, "mode": "ddp"}'
+```
+
 ### Run the server (PEFT backend)
 ```bash
 python -m hosted_tinker.api \
@@ -29,6 +45,28 @@ pytest tests/test_service.py tests/test_forward_backward.py tests/test_optim_ste
 ### Run all tests (with official Tinker API comparison)
 ```bash
 TINKER_API_KEY=tml-xxx pytest tests/ -v
+```
+
+### Change micro_batch_size at runtime (no server restart)
+```bash
+curl -s -X POST http://localhost:8000/admin/set_micro_batch_size \
+    -H "Content-Type: application/json" \
+    -d '{"n": 2}'
+```
+
+**mbs guidance (4× B200, Qwen3.5-35B-A3B):**
+- `mbs=1`: baseline, lowest memory (~54% GPU mem on fwd+bwd)
+- `mbs=2`: optimal for training — best fwd+bwd throughput, fits in B200 memory with gc=on
+- `mbs=4`: forward-only works (~28.7K tok/s), but **fwd+bwd OOMs** even with gc=on (logits tensor too large)
+
+To use `mbs=4` for forward and `mbs=2` for forward+backward, call the endpoint between passes:
+```python
+import requests
+requests.post("http://localhost:8000/admin/set_micro_batch_size", json={"n": 4})
+tc.forward(data, loss_fn="cross_entropy").result()
+
+requests.post("http://localhost:8000/admin/set_micro_batch_size", json={"n": 2})
+tc.forward_backward(data, loss_fn="cross_entropy").result()
 ```
 
 ### Lint

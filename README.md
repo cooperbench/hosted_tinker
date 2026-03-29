@@ -329,16 +329,6 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
 | forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
 
-### FSDP2 Backend: Micro-Batch Throughput on B200 (Qwen3.5-35B-A3B)
-
-4× B200 GPUs, 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), max 32K tokens, gc=on:
-
-| micro_batch_size | forward tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
-|---|---|---|---|---|---|---|
-| **1** | 23,403 | 64% | 42% | 2,550 | 76% | 54% |
-| **2** | **27,032** | **73%** | **61%** | **2,631** | **87%** | **82%** |
-| 4 | 28,483 | 73% | 58% | OOM | — | — |
-
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1,669,550 total tokens, max_seq_len=32768, lora_rank=32, gc=on.

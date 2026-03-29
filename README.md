@@ -339,8 +339,6 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | **2** | **27,032** | **73%** | **61%** | **2,631** | **87%** | **82%** |
 | 4 | 28,483 | 73% | 58% | OOM | — | — |
 
-> mbs=2 is optimal for training: +15% forward vs mbs=1, fwd+bwd viable. mbs=4 forward works (+5% vs mbs=2) but fwd+bwd OOMs — logits tensor (4 × 32K seq × vocab ≈ 64 GiB) exceeds B200's 178 GiB even with gc=on.
-
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1,669,550 total tokens, max_seq_len=32768, lora_rank=32, gc=on.
@@ -354,13 +352,6 @@ Two configs run in parallel across GPU slots 0–3 and 4–7.
 | Megatron DDP | 4 | 1 | 23,276 | 56% | 48% | 2,788 | 64% | 59% |
 | Megatron DDP | 4 | 2 | 23,429 | 57% | 66% | **2,798** | 64% | 66% |
 | Megatron DDP | 4 | 4 | 28,713 | 73% | 76% | OOM | — | — |
-
-**Key findings:**
-- **gc=on unlocks fwd+bwd for all configs**: FSDP2 fwd+bwd was previously OOM at mbs=1,2; Megatron mbs=2 fwd+bwd was OOM — all now complete
-- **Both backends match on forward** (~23K tok/s at mbs=1) — previous FSDP2 deficit was due to gc=off and different data distribution
-- **FSDP2 mbs=2 has best forward throughput** (27,032 tok/s, +16% vs mbs=1)
-- **Megatron DDP mbs=2 has best fwd+bwd throughput** (2,798 tok/s) with lower memory pressure than FSDP2
-- **mbs=4 forward works** (~28.6K tok/s, +5% vs mbs=2) but fwd+bwd OOMs on both backends — logits tensor (4 × 32K × vocab ≈ 64 GiB) is the bottleneck; gc=on reduces activations but cannot help logits
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

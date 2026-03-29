@@ -337,9 +337,9 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 |---|---|---|---|---|---|---|
 | **1** | 23,403 | 64% | 42% | 2,550 | 76% | 54% |
 | **2** | **27,032** | **73%** | **61%** | **2,631** | **87%** | **82%** |
-| 4+ | OOM | — | — | OOM | — | — |
+| 4 | 28,483 | 73% | 58% | OOM | — | — |
 
-> mbs=2 is optimal: +15% forward throughput, +3% fwd+bwd vs mbs=1. mbs=4+ OOMs (backward needs ~44 GiB; model+activations consume 150+ GiB of B200's 178 GiB).
+> mbs=2 is optimal for training: +15% forward vs mbs=1, fwd+bwd viable. mbs=4 forward works (+5% vs mbs=2) but fwd+bwd OOMs — logits tensor (4 × 32K seq × vocab ≈ 64 GiB) exceeds B200's 178 GiB even with gc=on.
 
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
@@ -350,15 +350,17 @@ Two configs run in parallel across GPU slots 0–3 and 4–7.
 |---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
 | FSDP2 | 4 | 1 | 23,403 | 64% | 42% | 2,550 | 76% | 54% |
 | FSDP2 | 4 | 2 | **27,032** | 73% | 61% | **2,631** | 87% | 82% |
+| FSDP2 | 4 | 4 | 28,483 | 73% | 58% | OOM | — | — |
 | Megatron DDP | 4 | 1 | 23,276 | 56% | 48% | 2,788 | 64% | 59% |
 | Megatron DDP | 4 | 2 | 23,429 | 57% | 66% | **2,798** | 64% | 66% |
+| Megatron DDP | 4 | 4 | 28,713 | 73% | 76% | OOM | — | — |
 
 **Key findings:**
 - **gc=on unlocks fwd+bwd for all configs**: FSDP2 fwd+bwd was previously OOM at mbs=1,2; Megatron mbs=2 fwd+bwd was OOM — all now complete
 - **Both backends match on forward** (~23K tok/s at mbs=1) — previous FSDP2 deficit was due to gc=off and different data distribution
 - **FSDP2 mbs=2 has best forward throughput** (27,032 tok/s, +16% vs mbs=1)
 - **Megatron DDP mbs=2 has best fwd+bwd throughput** (2,798 tok/s) with lower memory pressure than FSDP2
-- **OOM root cause**: logits tensor (mbs × seq_len × vocab = up to 64 GiB) is the bottleneck for mbs≥4; gc=on reduces activation memory but logits dominate at large mbs
+- **mbs=4 forward works** (~28.6K tok/s, +5% vs mbs=2) but fwd+bwd OOMs on both backends — logits tensor (4 × 32K × vocab ≈ 64 GiB) is the bottleneck; gc=on reduces activations but cannot help logits
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

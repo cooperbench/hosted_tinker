@@ -341,6 +341,38 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 
 > mbs=2 is optimal: +15% forward throughput, +4% fwd+bwd vs mbs=1. mbs=4+ OOMs (backward needs ~44 GiB; model+activations consume 150+ GiB of B200's 178 GiB).
 
+### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
+
+128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1.67M total tokens, max_seq_len=32768, lora_rank=32.
+Two configs run in parallel across GPU slots 0–3 and 4–7.
+
+#### forward (inference, no gradients)
+
+| backend | GPUs | mbs | tok/s | GPU util |
+|---------|------|-----|-------|----------|
+| FSDP2 | 4 | 1 | 9,127 | 39% |
+| FSDP2 | 4 | 2 | 9,308 | 91% |
+| Megatron DDP | 4 | 1 | 12,867 | 63% |
+| Megatron DDP | 4 | 2 | 14,660 | 73% |
+| **Megatron DDP** | **8** | **1** | **41,667** | **50%** |
+
+#### forward_backward (training step with gradients)
+
+| backend | GPUs | mbs | tok/s | GPU util |
+|---------|------|-----|-------|----------|
+| FSDP2 | 4 | 1 | OOM | — |
+| FSDP2 | 4 | 2 | OOM | — |
+| Megatron DDP | 4 | 1 | 1,438 | 65% |
+| Megatron DDP | 4 | 2 | OOM | — |
+| **Megatron DDP** | **8** | **1** | **5,006** | **57%** |
+
+**Key findings:**
+- **Megatron DDP 8-GPU mbs=1 is the best config**: 5,006 tok/s fwd+bwd, 3.5× faster than 4-GPU
+- **Megatron DDP forward beats FSDP2** (12,867 vs 9,127 tok/s at 4-GPU) because FSDP2 is bottlenecked by per-layer NCCL all-gathers (39% GPU util vs 63%)
+- **gc=on/off makes no difference** at mbs=1 — only LoRA params need gradients, so activation memory is the binding constraint, not gradient storage
+- **OOM root cause**: logits tensor (mbs × seq_len × vocab = up to 64 GiB) is the bottleneck for mbs≥4; backward at mbs=2 needs 30 GiB extra. Chunked logprob computation would unlock higher mbs
+- **8-GPU forward super-linear scaling** (3.24× with 2× GPUs): fewer sequences per rank → shorter max micro-batch length → less padding waste
+
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
 | Backend | Memory/GPU | Parallelism | Max Batch for 32K |

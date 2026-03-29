@@ -263,14 +263,15 @@ def main():
 
                     input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)
                     position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)
-                    attn_mask = torch.ones(1, total_len, dtype=torch.long, device=device)
+                    # attention_mask=None lets HF detect packed format from position_ids
+                    # resets and derive cu_seqlens internally for flash_attn_varlen_func
 
                     if compute_grad:
-                        out = model(input_ids=input_ids, attention_mask=attn_mask,
+                        out = model(input_ids=input_ids, attention_mask=None,
                                     position_ids=position_ids, use_cache=False)
                     else:
                         with torch.no_grad():
-                            out = model(input_ids=input_ids, attention_mask=attn_mask,
+                            out = model(input_ids=input_ids, attention_mask=None,
                                         position_ids=position_ids, use_cache=False)
 
                     log_probs = F.log_softmax(out.logits[0], dim=-1)  # [total_tokens, vocab]

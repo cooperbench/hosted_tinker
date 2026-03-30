@@ -355,12 +355,6 @@ Sequential runs on GPUs 0–3.
 | Megatron DDP | 4 | 1 | 25,134 | 76% | 32% | 9,974 | 75% | 40% |
 | Megatron DDP | 4 | 2 | **35,350** | 88% | 40% | **15,554** | 89% | 40% |
 
-**Key findings (H100, Qwen3.5-9B)**:
-- Megatron DDP with mbs=2 delivers best throughput: **35K fwd tok/s**, **15.5K fwd+bwd tok/s**
-- Megatron DDP achieves higher GPU utilization (88–89%) vs FSDP2 (49–79%)
-- FSDP2 uses more memory at mbs=2 (63% vs 40%) due to parameter sharding overhead
-- Both backends fit comfortably in H100 80GB memory with gc=on
-
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
 | Backend | Memory/GPU | Parallelism | Max Batch for 32K |

@@ -91,10 +91,18 @@ class FSDP2Backend(AbstractBackend):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         env["HF_HUB_OFFLINE"] = "1"
-        # GCP VMs set NCCL_NET=gIB for multi-node clusters
-        # Single-node NCCL setup: gIB transport requires InfiniBand hardware not present here.
-        # Use Socket transport which works for intra-node communication on all GPU types.
-        env["NCCL_NET"] = "Socket"
+        # GCP VMs set NCCL_NET=gIB for multi-node clusters but
+        # libibverbs.so is not installed on single-node VMs.
+        # Also strip /usr/local/gib from LD_LIBRARY_PATH — the gIB shim
+        # plugin loads via LD path even with NCCL_NET_PLUGIN="" and crashes
+        # when libibverbs.so is missing.
+        env["NCCL_NET_PLUGIN"] = ""
+        env.pop("NCCL_NET", None)
+        raw_ldpath = env.get("LD_LIBRARY_PATH", "")
+        fixed_ldpath = ":".join(
+            p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p
+        )
+        env["LD_LIBRARY_PATH"] = fixed_ldpath
         env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching FSDP2 workers on GPUs {gpu_ids} (port {master_port})")
@@ -153,7 +161,7 @@ class FSDP2Backend(AbstractBackend):
         with open(self._cmd_file, "wb") as f:
             pickle.dump(cmd, f)
 
-    def _read_result(self, timeout: float = 300) -> dict:
+    def _read_result(self, timeout: float = 1800) -> dict:
         """Read result pickle from rank 0."""
         start = time.time()
         while time.time() - start < timeout:
@@ -203,7 +211,7 @@ class FSDP2Backend(AbstractBackend):
         # Wait for result (long timeout for large batches)
         n_examples = len(prepared_batch.all_input_ids)
         max_len = max((len(ids) for ids in prepared_batch.all_input_ids), default=0)
-        timeout = max(300, n_examples * max_len / 100)  # Rough estimate
+        timeout = max(1800, n_examples * max_len / 100)  # Rough estimate; first call triggers Triton compilation
         result = self._read_result(timeout=timeout)
 
         # Build per-request results

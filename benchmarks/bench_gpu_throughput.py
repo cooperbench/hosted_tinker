@@ -1,6 +1,6 @@
 """GPU token throughput benchmark for hosted-tinker.
 
-Sends 128 mixed-length sequences (short + mid + long, up to 32768 tokens) as
+Sends 32 mixed-length sequences (short + mid + long, up to 8192 tokens) as
 a single batch and measures token throughput for forward-only and
 forward+backward passes. Polls nvidia-smi to report GPU utilization.
 
@@ -224,9 +224,9 @@ def main():
     parser.add_argument("--url", default="http://localhost:8000")
     parser.add_argument("--model", default="Qwen/Qwen3.5-35B-A3B")
     parser.add_argument("--lora-rank", type=int, default=32)
-    parser.add_argument("--n-examples", type=int, default=128)
+    parser.add_argument("--n-examples", type=int, default=32)
     parser.add_argument("--min-seq-len", type=int, default=64)
-    parser.add_argument("--max-seq-len", type=int, default=32768)
+    parser.add_argument("--max-seq-len", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)

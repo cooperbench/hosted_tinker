@@ -132,5 +132,35 @@ print('All packages OK')
 
 - H100 GPUs work with all backends (FSDP2, DDP, Megatron TP) out of the box
 - No NCCL P2P workarounds needed (unlike B200)
-- Standard NCCL collectives work for all operations
 - 80GB HBM3 is sufficient for Qwen3.5-9B with gc=on at mbs=2
+- Megatron DDP recommended over FSDP2 for better GPU utilization (89% vs 72%)
+
+## Troubleshooting
+
+### NCCL gIB crash on GCP VMs
+
+GCP VMs set `NCCL_NET=gIB` and include `/usr/local/gib` in `LD_LIBRARY_PATH` for multi-node InfiniBand. On single-node VMs without InfiniBand hardware, this causes NCCL to crash or hang.
+
+The backends auto-detect and strip these settings. If running manually:
+```bash
+unset NCCL_NET
+export NCCL_NET_PLUGIN=""
+export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -iv gib | tr '\n' ':')
+```
+
+### Slow forward pass
+
+If forward passes are ~10x slower than expected, install optimized kernels:
+```bash
+.venv/bin/pip install causal-conv1d --no-build-isolation
+.venv/bin/pip install flash-linear-attention
+```
+
+## Expected performance (4x H100, Qwen3.5-9B, gc=on)
+
+| Backend | mbs | Forward tok/s | Fwd+Bwd tok/s | GPU Util | Memory |
+|---------|-----|---------------|---------------|----------|--------|
+| Megatron DDP | 1 | 25,134 | 9,974 | 76% | 32% |
+| **Megatron DDP** | **2** | **35,350** | **15,554** | **89%** | **40%** |
+| FSDP2 | 1 | 25,591 | 8,621 | 72% | 40% |
+| FSDP2 | 2 | 17,060 | 7,995 | 79% | 63% |

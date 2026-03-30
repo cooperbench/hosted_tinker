@@ -227,18 +227,25 @@ def main():
             my_indices.sort(key=lambda i: len(all_input_ids[i]))
 
             # Process in micro-batches for higher GPU utilization.
-            # FSDP requires ALL ranks to call model() together (NCCL all-gather).
-            # When n_examples < world_size some ranks have empty my_indices — use a
-            # single dummy micro-batch for those ranks so FSDP collectives don't deadlock.
-            mb_schedule = list(range(0, len(my_indices), micro_batch_size)) or [None]
-            for mb_start in mb_schedule:
-                is_dummy = mb_start is None
+            # FSDP requires ALL ranks to call model() together (NCCL all-gather /
+            # reduce-scatter).  Different ranks may have different numbers of
+            # micro-batches, so we synchronise the count: ranks that run out of
+            # real data run a 1-token dummy forward (+ backward if training) to
+            # keep FSDP collectives in lock-step across all ranks.
+            n_my_mbs = max(1, (len(my_indices) + micro_batch_size - 1) // micro_batch_size) if my_indices else 0
+            mb_counts = [None] * world_size
+            dist.all_gather_object(mb_counts, n_my_mbs, group=obj_group)
+            n_total_mbs = max(mb_counts) if mb_counts else 1
+
+            for mb_i in range(n_total_mbs):
+                real_start = mb_i * micro_batch_size
+                is_dummy = real_start >= len(my_indices)
                 if is_dummy:
                     mb_indices = []
                     seqs = [[pad_id]]  # 1-token dummy keeps FSDP happy
                     max_len = 1
                 else:
-                    mb_indices = my_indices[mb_start:mb_start + micro_batch_size]
+                    mb_indices = my_indices[real_start:real_start + micro_batch_size]
                     seqs = [all_input_ids[i] for i in mb_indices]
                     max_len = max(len(s) for s in seqs)
 
@@ -255,6 +262,9 @@ def main():
                         out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
 
                 if is_dummy:
+                    if compute_grad:
+                        # Dummy ranks must participate in FSDP reduce-scatter.
+                        (out.logits.sum() * 0.0).backward()
                     del out, input_ids
                     continue
 

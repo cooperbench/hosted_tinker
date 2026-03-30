@@ -120,9 +120,17 @@ class MegatronBackend(AbstractBackend):
         env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         env["HF_HUB_OFFLINE"] = "1"
         # GCP VMs set NCCL_NET=gIB for multi-node clusters but
-        # libibverbs.so is not installed on single-node VMs
+        # libibverbs.so is not installed on single-node VMs.
+        # Also strip /usr/local/gib from LD_LIBRARY_PATH — the gIB shim
+        # plugin loads via LD path even with NCCL_NET_PLUGIN="" and crashes
+        # when libibverbs.so is missing.
         env["NCCL_NET_PLUGIN"] = ""
         env.pop("NCCL_NET", None)
+        raw_ldpath = env.get("LD_LIBRARY_PATH", "")
+        fixed_ldpath = ":".join(
+            p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p
+        )
+        env["LD_LIBRARY_PATH"] = fixed_ldpath
         # B200 GPUs need NCCL P2P disabled (pytorch#165727)
         # H100/A100 GPUs work fine with P2P enabled
         gpu_type = _detect_gpu_type()

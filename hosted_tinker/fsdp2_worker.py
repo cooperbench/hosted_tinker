@@ -11,6 +11,7 @@ Usage (internal, called by FSDP2Backend):
     torchrun --nproc_per_node=N hosted_tinker/fsdp2_worker.py \
         --base-model MODEL --lora-rank R --cmd-file /tmp/cmd.pkl --result-file /tmp/result.pkl
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,8 +45,10 @@ def _safe_loss_mask(values, mask):
 def cross_entropy_loss(lp, mask, _slp, _adv, _cfg):
     return -_safe_loss_mask(lp, mask)
 
+
 def importance_sampling_loss(lp, mask, slp, adv, _cfg):
     return -_safe_loss_mask(torch.exp(lp - slp) * adv, mask)
+
 
 def ppo_loss(lp, mask, slp, adv, cfg):
     cl = (cfg or {}).get("clip_low_threshold", _DEFAULT_CLIP_LOW)
@@ -53,14 +56,20 @@ def ppo_loss(lp, mask, slp, adv, cfg):
     ratio = torch.exp(lp - slp)
     return -_safe_loss_mask(torch.min(ratio * adv, torch.clamp(ratio, cl, ch) * adv), mask)
 
+
 def cispo_loss(lp, mask, slp, adv, cfg):
     cl = (cfg or {}).get("clip_low_threshold", _DEFAULT_CLIP_LOW)
     ch = (cfg or {}).get("clip_high_threshold", _DEFAULT_CLIP_HIGH)
     ratio = torch.exp(lp - slp)
     return -_safe_loss_mask(torch.clamp(ratio, cl, ch).detach() * lp * adv, mask)
 
-LOSS_FN_MAP = {"cross_entropy": cross_entropy_loss, "importance_sampling": importance_sampling_loss,
-               "ppo": ppo_loss, "cispo": cispo_loss}
+
+LOSS_FN_MAP = {
+    "cross_entropy": cross_entropy_loss,
+    "importance_sampling": importance_sampling_loss,
+    "ppo": ppo_loss,
+    "cispo": cispo_loss,
+}
 
 
 def _get_transformer_layer_cls(model):
@@ -83,8 +92,13 @@ def main():
     parser.add_argument("--cmd-file", required=True, help="Path to command pickle file")
     parser.add_argument("--result-file", required=True, help="Path to result pickle file")
     parser.add_argument("--lora-sync-dir", default="/dev/shm/lora_adapters")
-    parser.add_argument("--micro-batch-size", type=int, default=1,
-                        help="Number of sequences per GPU forward pass")
+    parser.add_argument("--micro-batch-size", type=int, default=1, help="Number of sequences per GPU forward pass")
+    parser.add_argument(
+        "--remove-padding",
+        action="store_true",
+        default=False,
+        help="Pack sequences to remove padding waste (requires flash_attn)",
+    )
     args = parser.parse_args()
 
     # Initialize distributed
@@ -97,6 +111,7 @@ def main():
     # torchrun always injects it — remove it before initializing NCCL.
     os.environ.pop("TORCH_NCCL_ASYNC_ERROR_HANDLING", None)
     from datetime import timedelta
+
     dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -111,9 +126,19 @@ def main():
 
     # Load model
     start = time.time()
+    if args.remove_padding:
+        try:
+            import flash_attn  # noqa: F401
+        except ImportError:
+            raise RuntimeError("--remove-padding requires flash_attn to be installed")
+        attn_impl = "flash_attention_2"
+    else:
+        attn_impl = "sdpa"
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        attn_implementation="sdpa",
+        args.base_model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn_impl,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
@@ -121,16 +146,29 @@ def main():
     module_names = {n.split(".")[-1] for n, _ in model.named_modules()}
     if args.lora_targets == "auto":
         targets = []
-        for mod in ["q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "out_proj",
-                     "gate_proj", "up_proj", "down_proj"]:
+        for mod in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]:
             if mod in module_names:
                 targets.append(mod)
     else:
         targets = args.lora_targets.split(",")
 
     peft_config = PeftLoraConfig(
-        task_type=TaskType.CAUSAL_LM, r=args.lora_rank, lora_alpha=args.lora_alpha,
-        lora_dropout=0.0, target_modules=targets, bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.0,
+        target_modules=targets,
+        bias="none",
     )
     model = get_peft_model(model, peft_config)
     model.enable_input_require_grads()
@@ -143,6 +181,7 @@ def main():
 
     # FSDP wrap
     from functools import partial
+
     layer_classes = _get_transformer_layer_cls(model)
     if layer_classes:
         auto_wrap = partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_classes)
@@ -150,7 +189,9 @@ def main():
         auto_wrap = None
 
     mixed_precision = MixedPrecision(
-        param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16,
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
     )
 
     model = FSDP(
@@ -243,59 +284,106 @@ def main():
                 if is_dummy:
                     mb_indices = []
                     seqs = [[pad_id]]  # 1-token dummy keeps FSDP happy
-                    max_len = 1
                 else:
-                    mb_indices = my_indices[real_start:real_start + micro_batch_size]
+                    mb_indices = my_indices[real_start : real_start + micro_batch_size]
                     seqs = [all_input_ids[i] for i in mb_indices]
-                    max_len = max(len(s) for s in seqs)
 
-                input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
-                attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
-                for j, seq in enumerate(seqs):
-                    input_ids[j, :len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-                    attn_mask[j, :len(seq)] = 1
-
-                if compute_grad:
-                    out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-                else:
-                    with torch.no_grad():
-                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
-
-                if is_dummy:
-                    if compute_grad:
-                        # Dummy ranks must participate in FSDP reduce-scatter.
-                        (out.logits.sum() * 0.0).backward()
-                    del out, input_ids
-                    continue
-
-                log_probs = F.log_softmax(out.logits, dim=-1)
-                del out
-
-                total_loss = None
-                for j, idx in enumerate(mb_indices):
-                    seq_len = len(all_input_ids[idx])
-                    tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
-                    target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-
-                    all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
+                if args.remove_padding and not is_dummy:
+                    # --- Packed (remove-padding) path ---
+                    # Concatenate all sequences into a single flat tensor [1, total_tokens]
+                    seq_lens_mb = [len(s) for s in seqs]
+                    flat_ids = []
+                    flat_pos = []
+                    for s in seqs:
+                        flat_ids.extend(s)
+                        flat_pos.extend(range(len(s)))  # position resets at each boundary
+                    input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+                    position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
                     if compute_grad:
-                        wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                        slp_t = torch.tensor(all_slp[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                        adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
-                        loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
-                        loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                        all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
-                        total_loss = loss_j if total_loss is None else total_loss + loss_j
+                        out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
                     else:
-                        all_losses[idx] = [0.0] * seq_len
+                        with torch.no_grad():
+                            out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
 
-                del log_probs, input_ids
+                    log_probs = F.log_softmax(out.logits[0], dim=-1)  # [T, V]
+                    del out
 
-                if compute_grad and total_loss is not None:
-                    # Divide by world_size: FSDP sums (not averages) grads across ranks,
-                    # so pre-scale the loss to produce the correct average gradient.
-                    (total_loss / world_size).backward()
+                    # Split packed logits back into per-example logprobs
+                    total_loss = None
+                    offset = 0
+                    for j, idx in enumerate(mb_indices):
+                        sl = seq_lens_mb[j]
+                        lp_slice = log_probs[offset : offset + sl]  # [sl, V]
+                        tgt = torch.tensor(all_targets[idx][:sl], dtype=torch.long, device=device)
+                        target_lp = lp_slice.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+
+                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
+
+                        if compute_grad:
+                            wt = torch.tensor(all_weights[idx][:sl], dtype=torch.bfloat16, device=device)
+                            slp_t = torch.tensor(all_slp[idx][:sl], dtype=torch.bfloat16, device=device)
+                            adv_t = torch.tensor(all_adv[idx][:sl], dtype=torch.bfloat16, device=device)
+                            loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
+                            loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
+                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                            total_loss = loss_j if total_loss is None else total_loss + loss_j
+                        else:
+                            all_losses[idx] = [0.0] * sl
+                        offset += sl
+
+                    del log_probs, input_ids
+
+                    if compute_grad and total_loss is not None:
+                        (total_loss / world_size).backward()
+
+                else:
+                    # --- Padded (original) path ---
+                    max_len = max(len(s) for s in seqs)
+                    input_ids = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+                    attn_mask = torch.zeros(len(seqs), max_len, dtype=torch.long, device=device)
+                    for j, seq in enumerate(seqs):
+                        input_ids[j, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+                        attn_mask[j, : len(seq)] = 1
+
+                    if compute_grad:
+                        out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+                    else:
+                        with torch.no_grad():
+                            out = model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+
+                    if is_dummy:
+                        if compute_grad:
+                            (out.logits.sum() * 0.0).backward()
+                        del out, input_ids
+                        continue
+
+                    log_probs = F.log_softmax(out.logits, dim=-1)
+                    del out
+
+                    total_loss = None
+                    for j, idx in enumerate(mb_indices):
+                        seq_len = len(all_input_ids[idx])
+                        tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
+                        target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+
+                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
+
+                        if compute_grad:
+                            wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                            slp_t = torch.tensor(all_slp[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                            adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
+                            loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
+                            loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
+                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                            total_loss = loss_j if total_loss is None else total_loss + loss_j
+                        else:
+                            all_losses[idx] = [0.0] * seq_len
+
+                    del log_probs, input_ids
+
+                    if compute_grad and total_loss is not None:
+                        (total_loss / world_size).backward()
 
             if compute_grad:
                 accum_count += 1
@@ -343,13 +431,13 @@ def main():
 
             # Extract and save LoRA weights (all ranks participate in state dict gather)
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
             full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
                 state = model.state_dict()
 
             if rank == 0:
-                lora_state = {k: v.contiguous() for k, v in state.items()
-                              if "lora_" in k or "modules_to_save" in k}
+                lora_state = {k: v.contiguous() for k, v in state.items() if "lora_" in k or "modules_to_save" in k}
 
                 save_dir = os.path.join(args.lora_sync_dir, "adapter")
                 os.makedirs(save_dir, exist_ok=True)
@@ -363,13 +451,13 @@ def main():
 
         elif cmd_type == "save_checkpoint":
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
             full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
                 state = model.state_dict()
 
             if rank == 0:
-                lora_state = {k: v.contiguous() for k, v in state.items()
-                              if "lora_" in k or "modules_to_save" in k}
+                lora_state = {k: v.contiguous() for k, v in state.items() if "lora_" in k or "modules_to_save" in k}
                 save_dir = cmd["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
                 save_file(lora_state, os.path.join(save_dir, "adapter_model.safetensors"))

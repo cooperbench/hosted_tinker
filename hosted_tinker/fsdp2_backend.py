@@ -6,6 +6,7 @@ data-parallel training. Communicates with workers via file-based IPC
 
 Supports Qwen3 MoE and Qwen3.5 models.
 """
+
 from __future__ import annotations
 
 import logging
@@ -33,7 +34,12 @@ class FSDP2BackendConfig(BaseModel, extra="forbid"):
     train_gpu_offset: int = Field(default=2, description="First GPU index for training (skip vLLM GPUs)")
     gradient_checkpointing: bool = Field(default=True, description="Enable gradient checkpointing")
     loss_chunk_size: int = Field(default=1024, description="Chunk size for logprob computation")
-    micro_batch_size: int = Field(default=1, description="Sequences per GPU forward pass (higher = better utilization but more memory)")
+    micro_batch_size: int = Field(
+        default=1, description="Sequences per GPU forward pass (higher = better utilization but more memory)"
+    )
+    remove_padding: bool = Field(
+        default=False, description="Pack sequences to remove padding waste (requires flash_attn)"
+    )
     # vLLM LoRA sync
     vllm_sync_url: str | None = Field(default=None, description="vLLM base URL for LoRA sync")
     lora_sync_dir: str = Field(default="/dev/shm/lora_adapters", description="Dir for LoRA weight sync")
@@ -66,26 +72,38 @@ class FSDP2Backend(AbstractBackend):
         if self._worker_process is not None:
             self._shutdown_workers()
 
-        gpu_ids = list(range(self.config.train_gpu_offset,
-                             self.config.train_gpu_offset + self.config.n_train_gpus))
+        gpu_ids = list(range(self.config.train_gpu_offset, self.config.train_gpu_offset + self.config.n_train_gpus))
         master_port = random.randint(29500, 29999)
 
         worker_module = "hosted_tinker.fsdp2_worker"
         cmd = [
-            sys.executable, "-m", "torch.distributed.run",
-            "--nproc_per_node", str(self.config.n_train_gpus),
-            "--master_port", str(master_port),
-            "-m", worker_module,
-            "--base-model", self.base_model_name,
-            "--lora-rank", str(lora_config.rank),
-            "--lora-alpha", str(int(lora_config.alpha)),
-            "--cmd-file", self._cmd_file,
-            "--result-file", self._result_file,
-            "--lora-sync-dir", self.config.lora_sync_dir,
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node",
+            str(self.config.n_train_gpus),
+            "--master_port",
+            str(master_port),
+            "-m",
+            worker_module,
+            "--base-model",
+            self.base_model_name,
+            "--lora-rank",
+            str(lora_config.rank),
+            "--lora-alpha",
+            str(int(lora_config.alpha)),
+            "--cmd-file",
+            self._cmd_file,
+            "--result-file",
+            self._result_file,
+            "--lora-sync-dir",
+            self.config.lora_sync_dir,
         ]
         if self.config.gradient_checkpointing:
             cmd.append("--gradient-checkpointing")
         cmd += ["--micro-batch-size", str(self.config.micro_batch_size)]
+        if self.config.remove_padding:
+            cmd.append("--remove-padding")
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
@@ -99,9 +117,7 @@ class FSDP2Backend(AbstractBackend):
         env["NCCL_NET_PLUGIN"] = ""
         env.pop("NCCL_NET", None)
         raw_ldpath = env.get("LD_LIBRARY_PATH", "")
-        fixed_ldpath = ":".join(
-            p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p
-        )
+        fixed_ldpath = ":".join(p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p)
         env["LD_LIBRARY_PATH"] = fixed_ldpath
         env.pop("NCCL_P2P_DISABLE", None)
 
@@ -110,8 +126,10 @@ class FSDP2Backend(AbstractBackend):
         log_path = os.path.join(self._ipc_dir, "worker.log")
         self._worker_log = open(log_path, "w")
         self._worker_process = subprocess.Popen(
-            cmd, env=env,
-            stdout=self._worker_log, stderr=subprocess.STDOUT,
+            cmd,
+            env=env,
+            stdout=self._worker_log,
+            stderr=subprocess.STDOUT,
         )
 
         # Wait for workers to be ready (they'll be waiting for first command)
@@ -124,12 +142,20 @@ class FSDP2Backend(AbstractBackend):
         # Give workers time to load model
         logger.info("Waiting for FSDP2 workers to load model...")
         # Send a no-op forward to verify workers are ready
-        self._send_command({"type": "forward", "batch": {
-            "all_input_ids": [[1, 2, 3]], "all_targets": [[2, 3, 0]],
-            "all_token_weights": [[1.0, 1.0, 1.0]], "all_sampling_logprobs": [[0.0, 0.0, 0.0]],
-            "all_advantages": [[0.0, 0.0, 0.0]], "all_loss_fns": ["cross_entropy"],
-            "all_loss_fn_configs": [None],
-        }})
+        self._send_command(
+            {
+                "type": "forward",
+                "batch": {
+                    "all_input_ids": [[1, 2, 3]],
+                    "all_targets": [[2, 3, 0]],
+                    "all_token_weights": [[1.0, 1.0, 1.0]],
+                    "all_sampling_logprobs": [[0.0, 0.0, 0.0]],
+                    "all_advantages": [[0.0, 0.0, 0.0]],
+                    "all_loss_fns": ["cross_entropy"],
+                    "all_loss_fn_configs": [None],
+                },
+            }
+        )
         result = self._read_result(timeout=900)  # Model load + FSDP init can take several minutes
         logger.info("FSDP2 workers ready")
 
@@ -205,8 +231,7 @@ class FSDP2Backend(AbstractBackend):
             "all_loss_fn_configs": prepared_batch.all_loss_fn_configs,
         }
 
-        self._send_command({"type": cmd_type, "batch": batch_dict,
-                            "micro_batch_size": self._micro_batch_size})
+        self._send_command({"type": cmd_type, "batch": batch_dict, "micro_batch_size": self._micro_batch_size})
 
         # Wait for result (long timeout for large batches)
         n_examples = len(prepared_batch.all_input_ids)
@@ -219,10 +244,12 @@ class FSDP2Backend(AbstractBackend):
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
             loss_fn_outputs = []
             for i in range(start_idx, end_idx):
-                loss_fn_outputs.append({
-                    "logprobs": {"data": result["logprobs"][i], "dtype": "float32"},
-                    "elementwise_loss": {"data": result["losses"][i], "dtype": "float32"},
-                })
+                loss_fn_outputs.append(
+                    {
+                        "logprobs": {"data": result["logprobs"][i], "dtype": "float32"},
+                        "elementwise_loss": {"data": result["losses"][i], "dtype": "float32"},
+                    }
+                )
             results[request_id] = types.ForwardBackwardOutput(
                 loss_fn_output_type="scalar",
                 loss_fn_outputs=loss_fn_outputs,
@@ -232,27 +259,31 @@ class FSDP2Backend(AbstractBackend):
         return results
 
     def forward_backward(
-        self, prepared_batch: types.PreparedModelPassBatch,
+        self,
+        prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         return self._run_model_pass(prepared_batch, compute_gradients=True)
 
     def forward(
-        self, prepared_batch: types.PreparedModelPassBatch,
+        self,
+        prepared_batch: types.PreparedModelPassBatch,
     ) -> dict[str, types.ForwardBackwardOutput | types.ErrorResponse]:
         return self._run_model_pass(prepared_batch, compute_gradients=False)
 
     def optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
         adam = request_data.adam_params
-        self._send_command({
-            "type": "optim_step",
-            "adam_params": {
-                "learning_rate": adam.learning_rate,
-                "beta1": adam.beta1,
-                "beta2": adam.beta2,
-                "eps": adam.eps,
-                "weight_decay": adam.weight_decay,
-            },
-        })
+        self._send_command(
+            {
+                "type": "optim_step",
+                "adam_params": {
+                    "learning_rate": adam.learning_rate,
+                    "beta1": adam.beta1,
+                    "beta2": adam.beta2,
+                    "eps": adam.eps,
+                    "weight_decay": adam.weight_decay,
+                },
+            }
+        )
 
         result = self._read_result(timeout=300)
         grad_norm = result.get("grad_norm", 0.0)
@@ -261,31 +292,36 @@ class FSDP2Backend(AbstractBackend):
         if self.config.vllm_sync_url and "lora_path" in result:
             self._sync_lora_to_vllm(model_id, result["lora_path"])
 
-        return types.OptimStepOutput(metrics={
-            "skyrl.ai/grad_norm": grad_norm,
-            "skyrl.ai/learning_rate": adam.learning_rate,
-        })
+        return types.OptimStepOutput(
+            metrics={
+                "skyrl.ai/grad_norm": grad_norm,
+                "skyrl.ai/learning_rate": adam.learning_rate,
+            }
+        )
 
     def _sync_lora_to_vllm(self, model_id: str, lora_path: str) -> None:
         """Reload LoRA adapter on vLLM."""
         import requests as req_mod
+
         url = self.config.vllm_sync_url
         try:
-            req_mod.post(f"{url}/v1/unload_lora_adapter",
-                         json={"lora_name": model_id}, timeout=30)
+            req_mod.post(f"{url}/v1/unload_lora_adapter", json={"lora_name": model_id}, timeout=30)
         except Exception:
             pass
         try:
-            r = req_mod.post(f"{url}/v1/load_lora_adapter",
-                             json={"lora_name": model_id, "lora_path": os.path.abspath(lora_path)},
-                             timeout=60)
+            r = req_mod.post(
+                f"{url}/v1/load_lora_adapter",
+                json={"lora_name": model_id, "lora_path": os.path.abspath(lora_path)},
+                timeout=60,
+            )
             if r.status_code == 200:
                 logger.info(f"Synced LoRA to vLLM: {model_id}")
         except Exception as e:
             logger.warning(f"vLLM LoRA sync failed: {e}")
 
     def sample(
-        self, prepared_batch: types.PreparedSampleBatch,
+        self,
+        prepared_batch: types.PreparedSampleBatch,
     ) -> dict[str, types.SampleOutput | types.ErrorResponse]:
         results = {}
         for request_id, model_id, start, end, _ in prepared_batch.request_batch_slices:
@@ -297,6 +333,7 @@ class FSDP2Backend(AbstractBackend):
 
     def save_checkpoint(self, output_path, model_id: str) -> None:
         import tarfile
+
         with tempfile.TemporaryDirectory() as tmpdir:
             save_dir = os.path.join(tmpdir, "adapter")
             self._send_command({"type": "save_checkpoint", "save_dir": save_dir})
@@ -310,6 +347,7 @@ class FSDP2Backend(AbstractBackend):
                 output_path.write_bytes(open(tar_path, "rb").read())
             else:
                 import shutil
+
                 shutil.copy2(tar_path, str(output_path))
 
     def load_checkpoint(self, checkpoint_path, model_id: str) -> None:
@@ -320,6 +358,7 @@ class FSDP2Backend(AbstractBackend):
             self.save_checkpoint(output_path, model_id)
         else:
             import tarfile
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 tar_path = os.path.join(tmpdir, "marker.tar.gz")
                 with tarfile.open(tar_path, "w:gz") as tar:
@@ -328,6 +367,7 @@ class FSDP2Backend(AbstractBackend):
                     output_path.write_bytes(open(tar_path, "rb").read())
                 else:
                     import shutil
+
                     shutil.copy2(tar_path, str(output_path))
 
     def delete_model(self, model_id: str) -> None:
@@ -348,4 +388,5 @@ class FSDP2Backend(AbstractBackend):
     def shutdown(self) -> None:
         self._shutdown_workers()
         import shutil
+
         shutil.rmtree(self._ipc_dir, ignore_errors=True)

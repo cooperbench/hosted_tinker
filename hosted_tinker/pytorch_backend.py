@@ -418,12 +418,15 @@ class PyTorchBackend(AbstractBackend):
                     )
 
             # Compute loss per example and accumulate gradients
+            total_loss = None
+            gpu_logprobs = []
+            gpu_elem_losses = []
+            seq_lens = []
             for i in range(bs):
-                seq_len = len(mb_input_ids[mb_start - mb_start + i])  # actual seq_len
                 seq_len_i = len(mb_input_ids[i])
+                seq_lens.append(seq_len_i)
 
-                lp_i = target_logprobs[i, :seq_len_i].detach().float().cpu().tolist()
-                all_logprobs_list.append(lp_i)
+                gpu_logprobs.append(target_logprobs[i, :seq_len_i].detach().float())
 
                 if compute_gradients:
                     loss_fn = LOSS_FN_MAP.get(mb_loss_fns[i], cross_entropy_loss)
@@ -434,27 +437,31 @@ class PyTorchBackend(AbstractBackend):
                         advantages_t[i, :seq_len_i],
                         mb_loss_configs[i],
                     )
-                    # Compute elementwise loss for reporting
+                    total_loss = loss if total_loss is None else total_loss + loss
                     with torch.no_grad():
-                        elem_loss = -(target_logprobs[i, :seq_len_i] * weights_t[i, :seq_len_i])
-                    all_losses_list.append(elem_loss.float().cpu().tolist())
+                        gpu_elem_losses.append(-(target_logprobs[i, :seq_len_i] * weights_t[i, :seq_len_i]).float())
 
-                    # Backward
-                    loss.backward(retain_graph=(i < bs - 1))
+            # Batch transfer GPU → CPU
+            if gpu_logprobs:
+                cpu_lps = [t.cpu().tolist() for t in gpu_logprobs]
+                all_logprobs_list.extend(cpu_lps)
+            if compute_gradients and gpu_elem_losses:
+                cpu_losses = [t.cpu().tolist() for t in gpu_elem_losses]
+                all_losses_list.extend(cpu_losses)
+            elif not compute_gradients:
+                for sl in seq_lens:
+                    all_losses_list.append([0.0] * sl)
 
-                    # Accumulate gradients for this model
+            if compute_gradients and total_loss is not None:
+                total_loss.backward()
+                # Accumulate gradients for all models in this micro-batch
+                for i in range(bs):
                     model_id = mb_model_ids[i]
                     if model_id in self._accum_grads:
                         self._accum_grads[model_id].accumulate()
-
-                    # Zero grads for next example
-                    self.model.zero_grad()
-                else:
-                    # No loss for forward-only
-                    all_losses_list.append([0.0] * seq_len_i)
+                self.model.zero_grad()
 
             del input_ids_t, attn_mask_t, target_ids_t, target_logprobs
-            torch.cuda.empty_cache()
 
         # Build per-request results
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:

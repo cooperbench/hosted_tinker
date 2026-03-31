@@ -270,7 +270,23 @@ class TinkerEngine:
         # Track last cleanup time for periodic stale session cleanup
         self._last_cleanup_time: float = time.time()
 
+        # Event-driven dispatch: notify file signals new work is available
+        self._notify_path = "/dev/shm/hosted_tinker_notify"
+
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _wait_for_work(self, timeout: float = 0.1) -> None:
+        """Wait for work notification with short polling, falling back to timeout."""
+        import os
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(self._notify_path):
+                try:
+                    os.unlink(self._notify_path)
+                except FileNotFoundError:
+                    pass
+                return
+            time.sleep(0.005)
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -651,8 +667,8 @@ class TinkerEngine:
                 _ = self.cleanup_stale_sessions()
                 self._last_cleanup_time = time.time()
 
-            # Poll every 100ms
-            time.sleep(0.1)
+            # Wait for new work notification or poll every 100ms as fallback
+            self._wait_for_work(timeout=0.1)
 
     def run(self):
         """Entry point to start the engine."""

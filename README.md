@@ -381,13 +381,13 @@ Sequential runs on GPUs 0–3. Merged: NCCL gIB fix (#7) + event-driven engine +
 
 | backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
 |---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
-| FSDP2 (remove_padding) | 4 | 1 | 43,691 | — | 30% | 12,924 | — | 39% |
-| FSDP2 (remove_padding) | 4 | 2 | **39,792** | — | 44% | **16,253** | — | 59% |
+| FSDP2 (remove_padding) | 4 | 1 | 44,076 | 89% | 30% | 13,780 | 91% | 40% |
+| FSDP2 (remove_padding) | 4 | 2 | **39,361** | 89% | 44% | **15,688** | 94% | 59% |
 
-**vs pre-merge baseline** (before issue #5 perf merge):
-- Forward mbs=2: 44,101 → 39,792 tok/s (within run-to-run variance)
-- Forward+backward mbs=2: 17,004 → 16,253 tok/s (within run-to-run variance)
-- Ablation showed none of the individual tricks significantly affect fwd+bwd throughput; 28% run-to-run variance dominates
+**vs pre-merge baseline** (before issues #5 + #7):
+- Forward mbs=1: 44,040 → 44,076 tok/s (no change)
+- Forward+backward mbs=2: 17,004 → 15,688 tok/s (within 28% run-to-run variance)
+- Ablation of 5 perf tricks showed none significantly affect fwd+bwd throughput
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

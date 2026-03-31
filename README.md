@@ -329,6 +329,20 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
 | forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
 
+### Megatron DDP vs FSDP2: Throughput on H100 (Qwen3.5-9B)
+
+32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
+Sequential runs on GPUs 0–3.
+
+| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
+| FSDP2 | 4 | 1 | 12,778 | 68% | 30% | 2,276 | 77% | 39% |
+| FSDP2 | 4 | 2 | 15,649 | 75% | 49% | 2,800 | 82% | 59% |
+| FSDP2 | 4 | 4 | **17,881** | 80% | 63% | 2,779 | 89% | 87% |
+| Megatron DDP | 4 | 1 | 14,439 | 69% | 32% | 2,583 | 69% | 40% |
+| Megatron DDP | 4 | 2 | 12,332 | 62% | 41% | 2,913 | 73% | 41% |
+| Megatron DDP | 4 | 4 | 15,009 | 68% | 41% | **2,936** | 73% | 41% |
+
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1,669,550 total tokens, max_seq_len=32768, lora_rank=32, gc=on.
@@ -359,6 +373,21 @@ Sequential runs on GPUs 0–3.
 | Megatron DDP | 4 | 1 | 25,394 | 76% | 32% | 10,250 | 74% | 40% |
 | Megatron DDP | 4 | 2 | 34,936 | 87% | 40% | 15,003 | 90% | 40% |
 | Megatron DDP | 4 | 4 | 29,268 | 82% | 56% | 10,655 | 96% | 77% |
+
+### FSDP2 Remove-Padding + Perf Merge: Throughput on H100 (Qwen3.5-9B)
+
+32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
+Sequential runs on GPUs 0–3. Merged: NCCL gIB fix (#7) + event-driven engine + deterministic micro-batch sync + batched GPU→CPU transfers + conditional Gloo + flash_attention_2 remove-padding (#5).
+
+| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
+| FSDP2 (remove_padding) | 4 | 1 | 43,691 | — | 30% | 12,924 | — | 39% |
+| FSDP2 (remove_padding) | 4 | 2 | **39,792** | — | 44% | **16,253** | — | 59% |
+
+**vs pre-merge baseline** (before issue #5 perf merge):
+- Forward mbs=2: 44,101 → 39,792 tok/s (within run-to-run variance)
+- Forward+backward mbs=2: 17,004 → 16,253 tok/s (within run-to-run variance)
+- Ablation showed none of the individual tricks significantly affect fwd+bwd throughput; 28% run-to-run variance dominates
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

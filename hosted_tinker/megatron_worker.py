@@ -169,13 +169,15 @@ def main():
                 del logits, out
 
                 total_loss = None
+                _gpu_lp = []
+                _gpu_idx = []
                 for j, idx in enumerate(mb_indices):
                     seq_len = len(batch["all_input_ids"][idx])
                     tgt = torch.tensor(batch["all_targets"][idx][:seq_len], dtype=torch.long, device=device)
                     target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                    all_lp[idx] = target_lp.detach().float().cpu().tolist()
-                    all_loss[idx] = [0.0] * seq_len
+                    _gpu_lp.append(target_lp.detach().float())
+                    _gpu_idx.append((idx, seq_len))
 
                     if compute_grad:
                         wt = torch.tensor(batch["all_token_weights"][idx][:seq_len], dtype=torch.bfloat16, device=device)
@@ -186,6 +188,12 @@ def main():
                         total_loss = loss_j if total_loss is None else total_loss + loss_j
 
                 del log_probs
+
+                # Batched GPU→CPU transfer
+                for k, (idx, seq_len) in enumerate(_gpu_idx):
+                    all_lp[idx] = _gpu_lp[k].cpu().tolist()
+                    all_loss[idx] = [0.0] * seq_len
+                del _gpu_lp, _gpu_idx
 
                 if compute_grad and total_loss is not None:
                     total_loss.backward()
@@ -217,10 +225,14 @@ def main():
                 pg["weight_decay"] = adam["weight_decay"]
 
             # Manual gradient all_reduce (since we don't use DDP)
+            # Coalesce into a single all_reduce for fewer NCCL calls
             trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-            if world_size > 1:
-                for p in trainable:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            if world_size > 1 and trainable:
+                grads = [p.grad.data for p in trainable]
+                flat = torch._utils._flatten_dense_tensors(grads)
+                dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+                for g, uf in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+                    g.copy_(uf)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, 1.0).item() if trainable else 0.0
 

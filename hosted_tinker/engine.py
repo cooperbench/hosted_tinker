@@ -1,6 +1,7 @@
 """Background engine for processing training requests."""
 
 import argparse
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -269,6 +270,9 @@ class TinkerEngine:
 
         # Track last cleanup time for periodic stale session cleanup
         self._last_cleanup_time: float = time.time()
+
+        # Event-driven dispatch: skip sleep when work is available
+        self._work_available = threading.Event()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
 
@@ -640,6 +644,8 @@ class TinkerEngine:
                 sample_requests = self.find_batchable_sample(session)
                 other_requests = self.find_single_requests(session)
 
+            had_work = bool(forward_backward_requests or forward_requests or sample_requests or other_requests)
+
             self.process_batch_requests(forward_backward_requests, self.process_forward_backward, "forward_backward")
             self.process_batch_requests(forward_requests, self.process_forward, "forward")
             self.process_batch_requests(sample_requests, self.process_sample, "sample")
@@ -651,8 +657,10 @@ class TinkerEngine:
                 _ = self.cleanup_stale_sessions()
                 self._last_cleanup_time = time.time()
 
-            # Poll every 100ms
-            time.sleep(0.1)
+            # Re-poll immediately if we just processed work; otherwise wait 100ms
+            if not had_work:
+                self._work_available.wait(timeout=0.1)
+                self._work_available.clear()
 
     def run(self):
         """Entry point to start the engine."""

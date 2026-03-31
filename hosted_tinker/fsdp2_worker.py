@@ -312,13 +312,17 @@ def main():
                     # Split packed logits back into per-example logprobs
                     total_loss = None
                     offset = 0
+                    _gpu_lp = []
+                    _gpu_loss = []
+                    _gpu_idx = []
                     for j, idx in enumerate(mb_indices):
                         sl = seq_lens_mb[j]
                         lp_slice = log_probs[offset : offset + sl]  # [sl, V]
                         tgt = torch.tensor(all_targets[idx][:sl], dtype=torch.long, device=device)
                         target_lp = lp_slice.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
+                        _gpu_lp.append(target_lp.detach().float())
+                        _gpu_idx.append(idx)
 
                         if compute_grad:
                             wt = torch.tensor(all_weights[idx][:sl], dtype=torch.bfloat16, device=device)
@@ -326,11 +330,18 @@ def main():
                             adv_t = torch.tensor(all_adv[idx][:sl], dtype=torch.bfloat16, device=device)
                             loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
                             loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                            _gpu_loss.append((-(target_lp * wt)).detach().float())
                             total_loss = loss_j if total_loss is None else total_loss + loss_j
                         else:
                             all_losses[idx] = [0.0] * sl
                         offset += sl
+
+                    # Batched GPU→CPU transfer
+                    for k, idx in enumerate(_gpu_idx):
+                        all_logprobs[idx] = _gpu_lp[k].cpu().tolist()
+                        if k < len(_gpu_loss):
+                            all_losses[idx] = _gpu_loss[k].cpu().tolist()
+                    del _gpu_lp, _gpu_loss, _gpu_idx
 
                     del log_probs, input_ids
 
@@ -362,12 +373,16 @@ def main():
                     del out
 
                     total_loss = None
+                    _gpu_lp = []
+                    _gpu_loss = []
+                    _gpu_idx = []
                     for j, idx in enumerate(mb_indices):
                         seq_len = len(all_input_ids[idx])
                         tgt = torch.tensor(all_targets[idx][:seq_len], dtype=torch.long, device=device)
                         target_lp = log_probs[j, :seq_len].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                        all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
+                        _gpu_lp.append(target_lp.detach().float())
+                        _gpu_idx.append(idx)
 
                         if compute_grad:
                             wt = torch.tensor(all_weights[idx][:seq_len], dtype=torch.bfloat16, device=device)
@@ -375,10 +390,17 @@ def main():
                             adv_t = torch.tensor(all_adv[idx][:seq_len], dtype=torch.bfloat16, device=device)
                             loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
                             loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                            all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                            _gpu_loss.append((-(target_lp * wt)).detach().float())
                             total_loss = loss_j if total_loss is None else total_loss + loss_j
                         else:
                             all_losses[idx] = [0.0] * seq_len
+
+                    # Batched GPU→CPU transfer
+                    for k, idx in enumerate(_gpu_idx):
+                        all_logprobs[idx] = _gpu_lp[k].cpu().tolist()
+                        if k < len(_gpu_loss):
+                            all_losses[idx] = _gpu_loss[k].cpu().tolist()
+                    del _gpu_lp, _gpu_loss, _gpu_idx
 
                     del log_probs, input_ids
 

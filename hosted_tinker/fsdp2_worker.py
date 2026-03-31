@@ -234,16 +234,14 @@ def _run_command_loop(rank, world_size, model, optimizer, tokenizer, lora_params
 
                 if remove_padding and not is_dummy:
                     # ── Packed path (flash_attention_2) ──
-                    # Concatenate all sequences into a single flat tensor [1, total_tokens].
-                    # flash_attn handles causal masking natively via position_ids resets.
                     seq_lens_mb = [len(s) for s in seqs]
                     flat_ids = []
                     flat_pos = []
                     for s in seqs:
                         flat_ids.extend(s)
-                        flat_pos.extend(range(len(s)))  # position resets at each boundary
-                    input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-                    position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+                        flat_pos.extend(range(len(s)))
+                    input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)
+                    position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)
 
                     if compute_grad:
                         out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
@@ -251,7 +249,7 @@ def _run_command_loop(rank, world_size, model, optimizer, tokenizer, lora_params
                         with torch.no_grad():
                             out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
 
-                    log_probs = F.log_softmax(out.logits[0], dim=-1)  # [T, V]
+                    log_probs = F.log_softmax(out.logits[0], dim=-1)
                     del out
 
                     total_loss = None

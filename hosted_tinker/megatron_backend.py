@@ -1,7 +1,7 @@
 """Megatron-Core backend for hosted-tinker.
 
-Uses mp.Process (spawn) to launch N worker processes with manual gradient
-all_reduce. Communicates with workers via multiprocessing queues.
+Uses Megatron-Core for distributed training with tensor parallelism.
+Runs as a torchrun subprocess with multiple workers.
 
 Supports both H100 and B200 GPUs:
 - H100: NCCL P2P works, standard collectives
@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
 import random
 import subprocess
+import sys
 import tempfile
 import time
-
-import torch.multiprocessing as mp
 
 from pydantic import BaseModel, Field
 
@@ -62,7 +62,12 @@ class MegatronBackendConfig(BaseModel, extra="forbid"):
 
 
 class MegatronBackend(AbstractBackend):
-    """Megatron-Core backend using mp.Process workers with queue-based IPC."""
+    """Megatron-Core backend using torchrun subprocess workers.
+
+    Similar to FSDP2Backend but uses Megatron's tensor parallelism
+    (all_reduce-based) instead of FSDP's parameter sharding.
+    This works on B200 GPUs where FSDP hangs.
+    """
 
     def __init__(self, base_model: str, config: MegatronBackendConfig):
         self.base_model_name = base_model
@@ -70,101 +75,92 @@ class MegatronBackend(AbstractBackend):
         self.metrics = types.EngineMetrics()
 
         self._models: dict[str, types.ModelMetadata] = {}
-        self._worker_processes: list[mp.Process] = []
+        self._worker_process: subprocess.Popen | None = None
         self._adapter_counter = 0
 
-        # Queue-based IPC
-        self._mp_ctx = mp.get_context("spawn")
-        self._cmd_queue: mp.Queue = self._mp_ctx.Queue()
-        self._result_queue: mp.Queue = self._mp_ctx.Queue()
-
-        # Keep a log dir for worker output
+        # IPC files
         self._ipc_dir = tempfile.mkdtemp(prefix="megatron_ipc_")
+        self._cmd_file = os.path.join(self._ipc_dir, "cmd.pkl")
+        self._result_file = os.path.join(self._ipc_dir, "result.pkl")
 
     def has_model(self, model_id: str) -> bool:
         return model_id in self._models
 
     def create_model(self, model_id: str, lora_config: types.LoraConfig) -> None:
-        if self._worker_processes:
+        if self._worker_process is not None:
             self._shutdown_workers()
 
         gpu_ids = list(range(self.config.train_gpu_offset,
                              self.config.train_gpu_offset + self.config.n_train_gpus))
         master_port = random.randint(29500, 29999)
 
-        env_overrides = {
-            "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids),
-            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            "HF_HUB_OFFLINE": "1",
-        }
-        env_removals = []
+        # Select worker based on mode
+        if self.config.mode == "tp":
+            worker_module = "hosted_tinker.megatron_tp_worker"
+        else:
+            worker_module = "hosted_tinker.megatron_worker"
+        cmd = [
+            sys.executable, "-m", "torch.distributed.run",
+            "--nproc_per_node", str(self.config.n_train_gpus),
+            "--master_port", str(master_port),
+            "-m", worker_module,
+            "--base-model", self.base_model_name,
+            "--lora-rank", str(lora_config.rank),
+            "--lora-alpha", str(int(lora_config.alpha)),
+            "--cmd-file", self._cmd_file,
+            "--result-file", self._result_file,
+            "--lora-sync-dir", self.config.lora_sync_dir,
+            "--micro-batch-size", str(self.config.micro_batch_size),
+        ]
+        if self.config.gradient_checkpointing:
+            cmd.append("--gradient-checkpointing")
 
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        env["HF_HUB_OFFLINE"] = "1"
         # GCP VMs set NCCL_NET=gIB for multi-node clusters but
         # libibverbs.so is not installed on single-node VMs.
         # Also strip /usr/local/gib from LD_LIBRARY_PATH — the gIB shim
         # plugin loads via LD path even with NCCL_NET_PLUGIN="" and crashes
         # when libibverbs.so is missing.
-        env_overrides["NCCL_NET_PLUGIN"] = ""
-        env_removals.append("NCCL_NET")
-        raw_ldpath = os.environ.get("LD_LIBRARY_PATH", "")
-        fixed_ldpath = ":".join(p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p)
-        env_overrides["LD_LIBRARY_PATH"] = fixed_ldpath
-
-        # GPU-specific NCCL config
+        env["NCCL_NET_PLUGIN"] = ""
+        env.pop("NCCL_NET", None)
+        raw_ldpath = env.get("LD_LIBRARY_PATH", "")
+        fixed_ldpath = ":".join(
+            p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p
+        )
+        env["LD_LIBRARY_PATH"] = fixed_ldpath
+        # B200 GPUs need NCCL P2P disabled (pytorch#165727)
+        # H100/A100 GPUs work fine with P2P enabled
         gpu_type = _detect_gpu_type()
         if gpu_type == "B200":
-            env_overrides["NCCL_P2P_DISABLE"] = "1"
+            env["NCCL_P2P_DISABLE"] = "1"
         else:
-            env_removals.append("NCCL_P2P_DISABLE")
-
-        worker_args = {
-            "base_model": self.base_model_name,
-            "lora_rank": lora_config.rank,
-            "lora_alpha": int(lora_config.alpha),
-            "gradient_checkpointing": self.config.gradient_checkpointing,
-            "lora_sync_dir": self.config.lora_sync_dir,
-            "micro_batch_size": self.config.micro_batch_size,
-        }
-
-        # Select worker based on mode
-        if self.config.mode == "tp":
-            raise NotImplementedError("TP mode not yet supported with queue IPC; use torchrun fallback")
-        else:
-            from hosted_tinker.megatron_worker import worker_main
+            env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching Megatron workers on GPUs {gpu_ids} (port {master_port})")
 
-        self._worker_processes = []
-        for local_rank in range(self.config.n_train_gpus):
-            p = self._mp_ctx.Process(
-                target=worker_main,
-                args=(
-                    local_rank,
-                    self.config.n_train_gpus,
-                    master_port,
-                    worker_args,
-                    self._cmd_queue,
-                    self._result_queue,
-                    env_overrides,
-                    env_removals,
-                ),
-                daemon=True,
-            )
-            p.start()
-            self._worker_processes.append(p)
+        log_path = os.path.join(self._ipc_dir, "worker.log")
+        self._worker_log = open(log_path, "w")
+        self._worker_process = subprocess.Popen(
+            cmd, env=env, stdout=self._worker_log, stderr=subprocess.STDOUT,
+        )
 
         time.sleep(2)
-        if all(not p.is_alive() for p in self._worker_processes):
-            raise RuntimeError("Megatron workers crashed on startup")
+        if self._worker_process.poll() is not None:
+            output = open(log_path).read()[-2000:] if os.path.exists(log_path) else ""
+            raise RuntimeError(f"Megatron workers crashed: {output}")
 
         logger.info("Waiting for Megatron workers to load model...")
+        # Send init probe
         self._send_command({"type": "forward", "batch": {
             "all_input_ids": [[1, 2, 3]], "all_targets": [[2, 3, 0]],
             "all_token_weights": [[1.0, 1.0, 1.0]], "all_sampling_logprobs": [[0.0, 0.0, 0.0]],
             "all_advantages": [[0.0, 0.0, 0.0]], "all_loss_fns": ["cross_entropy"],
             "all_loss_fn_configs": [None],
         }})
-        self._read_result(timeout=900)
+        result = self._read_result(timeout=900)
         logger.info("Megatron workers ready")
 
         self._models[model_id] = types.ModelMetadata(
@@ -173,6 +169,9 @@ class MegatronBackend(AbstractBackend):
         )
         self._adapter_counter += 1
 
+        # Save initial (random) LoRA weights and sync to vLLM so inference is available
+        # before the first rollout. Uses a zero-lr optim step to trigger the worker's
+        # LoRA save path without changing any weights.
         if self.config.vllm_sync_url:
             logger.info("Syncing initial LoRA weights to vLLM...")
             self._send_command({
@@ -188,18 +187,30 @@ class MegatronBackend(AbstractBackend):
                 logger.info("Initial LoRA synced to vLLM")
 
     def _send_command(self, cmd: dict) -> None:
-        """Put command on the queue for rank 0 to read."""
-        self._cmd_queue.put(cmd)
+        with open(self._cmd_file, "wb") as f:
+            pickle.dump(cmd, f)
 
     def _read_result(self, timeout: float = 300) -> dict:
-        """Read result from the result queue."""
-        try:
-            result = self._result_queue.get(timeout=timeout)
-        except Exception:
-            if all(not p.is_alive() for p in self._worker_processes):
-                raise RuntimeError("Megatron workers crashed")
-            raise TimeoutError(f"Megatron result not received after {timeout}s")
-        return result
+        start = time.time()
+        while time.time() - start < timeout:
+            if os.path.exists(self._result_file):
+                time.sleep(0.01)
+                try:
+                    with open(self._result_file, "rb") as f:
+                        result = pickle.load(f)
+                    os.unlink(self._result_file)
+                    return result
+                except (EOFError, pickle.UnpicklingError):
+                    time.sleep(0.1)
+                    continue
+
+            if self._worker_process and self._worker_process.poll() is not None:
+                log_path = os.path.join(self._ipc_dir, "worker.log")
+                output = open(log_path).read()[-2000:] if os.path.exists(log_path) else ""
+                raise RuntimeError(f"Megatron workers crashed: {output}")
+
+            time.sleep(0.05)
+        raise TimeoutError(f"Megatron result not received after {timeout}s")
 
     def _run_model_pass(
         self, prepared_batch: types.PreparedModelPassBatch, compute_gradients: bool,
@@ -319,17 +330,16 @@ class MegatronBackend(AbstractBackend):
         self._models.pop(model_id, None)
 
     def _shutdown_workers(self):
-        if self._worker_processes:
+        if self._worker_process:
             try:
                 self._send_command({"type": "shutdown"})
-                for p in self._worker_processes:
-                    p.join(timeout=30)
+                self._worker_process.wait(timeout=30)
             except Exception:
-                pass
-            for p in self._worker_processes:
-                if p.is_alive():
-                    p.kill()
-            self._worker_processes = []
+                try:
+                    self._worker_process.kill()
+                except Exception:
+                    pass
+            self._worker_process = None
 
     def shutdown(self):
         self._shutdown_workers()

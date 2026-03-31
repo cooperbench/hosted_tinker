@@ -374,20 +374,6 @@ Sequential runs on GPUs 0–3.
 | Megatron DDP | 4 | 2 | 34,936 | 87% | 40% | 15,003 | 90% | 40% |
 | Megatron DDP | 4 | 4 | 29,268 | 82% | 56% | 10,655 | 96% | 77% |
 
-### FSDP2 Remove-Padding + Perf Merge: Throughput on H100 (Qwen3.5-9B)
-
-32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
-Sequential runs on GPUs 0–3. Merged: NCCL gIB fix (#7) + event-driven engine + deterministic micro-batch sync + batched GPU→CPU transfers + conditional Gloo + flash_attention_2 remove-padding (#5).
-
-| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
-|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
-| FSDP2 (remove_padding) | 4 | 1 | 44,076 | 89% | 30% | 13,780 | 91% | 40% |
-| FSDP2 (remove_padding) | 4 | 2 | **39,361** | 89% | 44% | **15,688** | 94% | 59% |
-
-**vs pre-merge baseline** (before issues #5 + #7):
-- Forward mbs=1: 44,040 → 44,076 tok/s (no change)
-- Forward+backward mbs=2: 17,004 → 15,688 tok/s (within 28% run-to-run variance)
-- Ablation of 5 perf tricks showed none significantly affect fwd+bwd throughput
 
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 

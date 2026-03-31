@@ -18,27 +18,11 @@ import sys
 import tempfile
 import time
 
+import torch
 from pydantic import BaseModel, Field
 
 from hosted_tinker.backend import AbstractBackend
 from hosted_tinker import types
-
-
-def _detect_gpu_type() -> str:
-    """Detect GPU type via nvidia-smi. Returns 'H100', 'B200', 'A100', or 'unknown'."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            name = result.stdout.strip().split("\n")[0].upper()
-            for family in ("H100", "B200", "A100"):
-                if family in name:
-                    return family
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return "unknown"
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +68,7 @@ class FSDP2Backend(AbstractBackend):
         return model_id in self._models
 
     def create_model(self, model_id: str, lora_config: types.LoraConfig) -> None:
+        # Launch torchrun workers
         if self._worker_process is not None:
             self._shutdown_workers()
 
@@ -134,13 +119,7 @@ class FSDP2Backend(AbstractBackend):
         raw_ldpath = env.get("LD_LIBRARY_PATH", "")
         fixed_ldpath = ":".join(p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p)
         env["LD_LIBRARY_PATH"] = fixed_ldpath
-
-        # GPU-specific NCCL config
-        gpu_type = _detect_gpu_type()
-        if gpu_type == "B200":
-            env["NCCL_P2P_DISABLE"] = "1"
-        else:
-            env.pop("NCCL_P2P_DISABLE", None)
+        env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching FSDP2 workers on GPUs {gpu_ids} (port {master_port})")
 
@@ -153,14 +132,16 @@ class FSDP2Backend(AbstractBackend):
             stderr=subprocess.STDOUT,
         )
 
-        # Wait for workers to be ready
+        # Wait for workers to be ready (they'll be waiting for first command)
         time.sleep(2)
         if self._worker_process.poll() is not None:
+            log_path = os.path.join(self._ipc_dir, "worker.log")
             output = open(log_path).read()[-2000:] if os.path.exists(log_path) else ""
             raise RuntimeError(f"FSDP2 workers crashed: {output}")
 
-        # Send a no-op forward to verify workers are ready
+        # Give workers time to load model
         logger.info("Waiting for FSDP2 workers to load model...")
+        # Send a no-op forward to verify workers are ready
         self._send_command(
             {
                 "type": "forward",
@@ -175,7 +156,7 @@ class FSDP2Backend(AbstractBackend):
                 },
             }
         )
-        self._read_result(timeout=900)
+        result = self._read_result(timeout=900)  # Model load + FSDP init can take several minutes
         logger.info("FSDP2 workers ready")
 
         self._models[model_id] = types.ModelMetadata(
@@ -211,7 +192,7 @@ class FSDP2Backend(AbstractBackend):
         start = time.time()
         while time.time() - start < timeout:
             if os.path.exists(self._result_file):
-                time.sleep(0.01)
+                time.sleep(0.01)  # Small delay to ensure write is complete
                 try:
                     with open(self._result_file, "rb") as f:
                         result = pickle.load(f)
@@ -239,6 +220,7 @@ class FSDP2Backend(AbstractBackend):
         cmd_type = "forward_backward" if compute_gradients else "forward"
         self._refresh_micro_batch_size()
 
+        # Serialize batch as dict (Pydantic model -> dict for pickle)
         batch_dict = {
             "all_input_ids": prepared_batch.all_input_ids,
             "all_targets": prepared_batch.all_targets,
@@ -251,11 +233,13 @@ class FSDP2Backend(AbstractBackend):
 
         self._send_command({"type": cmd_type, "batch": batch_dict, "micro_batch_size": self._micro_batch_size})
 
+        # Wait for result (long timeout for large batches)
         n_examples = len(prepared_batch.all_input_ids)
         max_len = max((len(ids) for ids in prepared_batch.all_input_ids), default=0)
-        timeout = max(1800, n_examples * max_len / 100)
+        timeout = max(1800, n_examples * max_len / 100)  # Rough estimate; first call triggers Triton compilation
         result = self._read_result(timeout=timeout)
 
+        # Build per-request results
         results: dict[str, types.ForwardBackwardOutput | types.ErrorResponse] = {}
         for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
             loss_fn_outputs = []
@@ -304,6 +288,7 @@ class FSDP2Backend(AbstractBackend):
         result = self._read_result(timeout=300)
         grad_norm = result.get("grad_norm", 0.0)
 
+        # Sync LoRA to vLLM if configured
         if self.config.vllm_sync_url and "lora_path" in result:
             self._sync_lora_to_vllm(model_id, result["lora_path"])
 

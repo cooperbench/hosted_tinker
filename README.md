@@ -374,6 +374,21 @@ Sequential runs on GPUs 0–3.
 | Megatron DDP | 4 | 2 | 34,936 | 87% | 40% | 15,003 | 90% | 40% |
 | Megatron DDP | 4 | 4 | 29,268 | 82% | 56% | 10,655 | 96% | 77% |
 
+### FSDP2 Remove-Padding + Perf Merge: Throughput on H100 (Qwen3.5-9B)
+
+32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
+Sequential runs on GPUs 0–3. Merged: mp.Process + queue IPC (#5) + NCCL gIB fix (#7) + flash_attention_2 remove-padding.
+
+| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
+| FSDP2 (remove_padding) | 4 | 1 | 39,146 | 88% | 30% | 12,924 | 92% | 39% |
+| FSDP2 (remove_padding) | 4 | 2 | **48,812** | 88% | 44% | **15,068** | 95% | 54% |
+
+**vs pre-merge baseline** (torchrun + file IPC, same flash_attention_2):
+- Forward mbs=2: 44,101 → **48,812 tok/s (+10.7%)** — queue IPC eliminates file polling overhead
+- Forward+backward mbs=2: 17,004 → 15,068 tok/s (−11.4%) — deterministic micro-batch sync adds extra dummy batches
+- GPU utilization improved: 52% → 88% (fwd), 82% → 95% (fwd+bwd)
+
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
 | Backend | Memory/GPU | Parallelism | Max Batch for 32K |

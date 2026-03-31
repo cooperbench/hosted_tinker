@@ -1,15 +1,40 @@
 # Benchmarks
 
-Token throughput benchmarks for hosted-tinker backends on B200 GPUs.
+Token throughput benchmarks for hosted-tinker backends and vLLM inference.
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
+| `bench_vllm_inference.py` | vLLM inference throughput: sweeps TP, max_num_seqs, gpu_mem, CUDA graphs |
 | `bench_backends.py` | Unified sweep: runs multiple backends × mbs in parallel across two 4-GPU slots |
 | `bench_gpu_throughput.py` | Single-server throughput: forward and fwd+bwd tok/s against a running server |
 | `bench_micro_batch.py` | mbs sweep against a single running FSDP2 server (no restart between mbs values) |
 | `bench_megatron_throughput.py` | Megatron-specific sweep across modes (ddp/tp) and mbs values |
+
+---
+
+## vLLM inference results — Qwen/Qwen3.5-9B on 4x H100
+
+Benchmark: `bench_vllm_inference.py` with `max_output_len=2048`, `max_model_len=8192`.
+
+### TP sweep (16 concurrent requests, seqs=16)
+
+| Config | Output tok/s | TTFT p50 (ms) | Wall time (s) |
+|--------|-------------|---------------|---------------|
+| tp=1, eager | 519 | 309 | 32.8 |
+| tp=2, eager | 369 | 684 | 76.3 |
+| tp=4, eager | 419 | 523 | 77.2 |
+| tp=4, CUDA graphs | 4,062 | 154 | 8.1 |
+
+### Scaling with concurrency (tp=4, seqs=64, CUDA graphs)
+
+| Concurrent Requests | Output tok/s | Wall time (s) | TTFT p50 (ms) |
+|---------------------|-------------|---------------|---------------|
+| 16 | 3,859 | 8.0 | 119 |
+| 32 | 7,072 | 9.1 | 214 |
+| 64 | 11,682 | 11.0 | 274 |
+| 128 | 11,138 | 21.8 | 1,029 |
 
 ---
 
@@ -144,3 +169,4 @@ python benchmarks/bench_megatron_throughput.py \
 - `bench_backends.py` creates isolated SQLite DBs per server port under `/tmp/` and cleans them up on restart.
 - GPU memory polling uses `nvidia-smi`; ensure it is available in `PATH`.
 - With `gc=on`, mbs=1 and mbs=2 fwd+bwd complete on B200. mbs=4 fwd+bwd OOMs on both backends (logits tensor bottleneck).
+- If multi-GPU NCCL fails on GCP VMs, run `/setup-nccl` in Claude Code for a guided fix.

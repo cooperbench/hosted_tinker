@@ -329,6 +329,18 @@ PEFT backend, 4× B200 GPUs (train) + 4× B200 (vLLM TP=4):
 | forward_backward | 8,192 | 1.4s | 1.7s | **1.29×** |
 | forward_backward | 32,768 | 9.2s | 9.2s | **1.00×** |
 
+### Megatron DDP vs FSDP2: Throughput on H100 (Qwen3.5-9B)
+
+32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
+Sequential runs on GPUs 0–3.
+
+| backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
+|---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
+| FSDP2 | 4 | 1 | 13,275 | 56% | 30% | 2,321 | 81% | 38% |
+| FSDP2 | 4 | 2 | **17,040** | 63% | 48% | **2,782** | 85% | 58% |
+| Megatron DDP | 4 | 1 | 12,823 | 63% | 32% | **2,848** | 74% | 40% |
+| Megatron DDP | 4 | 2 | 15,005 | 68% | 40% | 2,804 | 74% | 40% |
+
 ### Megatron DDP vs FSDP2: Throughput on B200 (Qwen3.5-35B-A3B)
 
 128 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥24K tok), 1,669,550 total tokens, max_seq_len=32768, lora_rank=32, gc=on.

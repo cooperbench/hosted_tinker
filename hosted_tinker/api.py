@@ -241,6 +241,18 @@ async def get_model(session: AsyncSession, model_id: str) -> ModelDB:
     return model
 
 
+_NOTIFY_PATH = "/dev/shm/hosted_tinker_notify"
+
+
+def _notify_engine():
+    """Touch the signal file to wake up the engine's dispatch loop."""
+    try:
+        with open(_NOTIFY_PATH, "w") as f:
+            f.write("1")
+    except Exception:
+        pass
+
+
 async def create_future(
     session: AsyncSession,
     request_type: types.RequestType,
@@ -257,6 +269,8 @@ async def create_future(
     session.add(future_db)
     await session.flush()  # Flush to generate auto-increment request_id
     assert future_db.request_id
+    # Notify engine that new work is available (touch signal file)
+    _notify_engine()
     return future_db.request_id
 
 

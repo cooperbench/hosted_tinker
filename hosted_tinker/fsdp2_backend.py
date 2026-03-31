@@ -15,12 +15,31 @@ import random
 import tempfile
 import time
 
+import subprocess
+
 import torch.multiprocessing as mp
 
 from pydantic import BaseModel, Field
 
 from hosted_tinker.backend import AbstractBackend
 from hosted_tinker import types
+
+
+def _detect_gpu_type() -> str:
+    """Detect GPU type via nvidia-smi. Returns 'H100', 'B200', 'A100', or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            name = result.stdout.strip().split("\n")[0].upper()
+            for family in ("H100", "B200", "A100"):
+                if family in name:
+                    return family
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "unknown"
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +98,20 @@ class FSDP2Backend(AbstractBackend):
         env_overrides = {
             "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids),
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            "NCCL_NET": "Socket",
         }
         if os.environ.get("HF_HUB_OFFLINE") == "1":
             env_overrides["HF_HUB_OFFLINE"] = "1"
-        # Remove NCCL_P2P_DISABLE for FSDP2 (not needed)
-        env_removals = ["NCCL_P2P_DISABLE"]
+        env_removals = []
+
+        # GPU-specific NCCL config
+        gpu_type = _detect_gpu_type()
+        if gpu_type == "B200":
+            # B200: Socket transport (gIB not available), P2P disabled
+            env_overrides["NCCL_NET"] = "Socket"
+            env_overrides["NCCL_P2P_DISABLE"] = "1"
+        else:
+            # H100/A100: NVLink works, remove any GCP overrides
+            env_removals.extend(["NCCL_NET", "NCCL_P2P_DISABLE"])
 
         worker_args = {
             "base_model": self.base_model_name,

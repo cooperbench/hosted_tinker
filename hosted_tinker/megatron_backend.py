@@ -95,18 +95,21 @@ class MegatronBackend(AbstractBackend):
         env_overrides = {
             "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids),
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-            "NCCL_NET_PLUGIN": "",
         }
         if os.environ.get("HF_HUB_OFFLINE") == "1":
             env_overrides["HF_HUB_OFFLINE"] = "1"
-        env_removals = ["NCCL_NET"]
+        env_removals = []
 
-        # B200 GPUs need NCCL P2P disabled (pytorch#165727)
+        # GPU-specific NCCL config
         gpu_type = _detect_gpu_type()
         if gpu_type == "B200":
+            # B200: Socket transport, NCCL_NET_PLUGIN disabled, P2P disabled
+            env_overrides["NCCL_NET_PLUGIN"] = ""
             env_overrides["NCCL_P2P_DISABLE"] = "1"
+            env_removals.append("NCCL_NET")
         else:
-            env_removals.append("NCCL_P2P_DISABLE")
+            # H100/A100: NVLink works, remove any GCP overrides
+            env_removals.extend(["NCCL_NET", "NCCL_NET_PLUGIN", "NCCL_P2P_DISABLE"])
 
         worker_args = {
             "base_model": self.base_model_name,

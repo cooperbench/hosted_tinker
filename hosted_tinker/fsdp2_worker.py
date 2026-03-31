@@ -444,10 +444,13 @@ def worker_main(local_rank, world_size, master_port, args_dict, cmd_queue, resul
     dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
     rank = dist.get_rank()
 
-    obj_group = dist.new_group(backend="gloo")
+    # On B200, NCCL object collectives hang — use Gloo fallback.
+    # On H100/A100, NCCL works fine — use default (None) for speed.
+    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
 
     if rank == 0:
-        logger.info(f"FSDP2 worker (queue): {world_size} GPUs, model={args_dict['base_model']}")
+        logger.info(f"FSDP2 worker (queue): {world_size} GPUs, model={args_dict['base_model']}, gloo={'yes' if _use_gloo else 'no'}")
 
     remove_padding = args_dict.get("remove_padding", False)
     if remove_padding and rank == 0:
@@ -509,7 +512,8 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    obj_group = dist.new_group(backend="gloo")
+    _use_gloo = os.environ.get("NCCL_P2P_DISABLE") == "1"
+    obj_group = dist.new_group(backend="gloo") if _use_gloo else None
 
     if rank == 0:
         logger.info(f"FSDP2 worker (torchrun): {world_size} GPUs, model={args.base_model}, rank={args.lora_rank}")

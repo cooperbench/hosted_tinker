@@ -51,8 +51,9 @@ def launch_vllm(
     enforce_eager: bool,
 ) -> subprocess.Popen:
     """Launch a vLLM server and wait until ready."""
+    vllm_python = os.environ.get("VLLM_PYTHON", sys.executable)
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        vllm_python, "-m", "vllm.entrypoints.openai.api_server",
         "--model", model,
         "--port", str(port),
         "--gpu-memory-utilization", str(gpu_mem),
@@ -68,8 +69,8 @@ def launch_vllm(
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-    # gIB NCCL fix: remove forced gIB transport, let NCCL auto-detect
-    env.pop("NCCL_NET", None)
+    # GCP non-RDMA VMs need Socket transport (gIB plugin fails without IB)
+    env["NCCL_NET"] = "Socket"
     env.setdefault("NCCL_TUNER_CONFIG_PATH", "/usr/local/gib/configs")
 
     log_path = f"vllm_bench_{port}_{os.getpid()}.log"
@@ -267,38 +268,44 @@ def main():
     # Small warmup prompts
     warmup_prompts = make_prompts(args.warmup, [128] * args.warmup, rng)
 
-    # Configurations to test
+    # Configurations to test — all use tp=n_gpus for max throughput
     configs = []
+    best_tp = n_gpus
 
-    # 1. TP sweep (tp=1, tp=2, tp=4 if enough GPUs)
-    for tp in [1, 2, 4]:
-        if tp <= n_gpus:
-            configs.append(VLLMConfig(
-                tp=tp, max_num_seqs=16, gpu_mem=0.90,
-                enforce_eager=True, label=f"tp{tp}",
-            ))
-
-    # 2. max_num_seqs sweep (with best tp from above, we'll use tp=n_gpus)
-    best_tp = n_gpus  # full TP uses all GPUs
-    for seqs in [4, 8, 16, 32, 64]:
-        if seqs == 16:
-            continue  # already covered
-        configs.append(VLLMConfig(
-            tp=best_tp, max_num_seqs=seqs, gpu_mem=0.90,
-            enforce_eager=True, label=f"seqs{seqs}",
-        ))
-
-    # 3. gpu_memory_utilization sweep
-    for mem in [0.80, 0.95]:
-        configs.append(VLLMConfig(
-            tp=best_tp, max_num_seqs=16, gpu_mem=mem,
-            enforce_eager=True, label=f"mem{mem}",
-        ))
-
-    # 4. enforce_eager=False (CUDA graphs enabled)
+    # 1. Eager baseline
     configs.append(VLLMConfig(
         tp=best_tp, max_num_seqs=16, gpu_mem=0.90,
-        enforce_eager=False, label="cuda_graphs",
+        enforce_eager=True, label="eager_s16",
+    ))
+
+    # 2. CUDA graphs (key optimization)
+    configs.append(VLLMConfig(
+        tp=best_tp, max_num_seqs=16, gpu_mem=0.90,
+        enforce_eager=False, label="graph_s16",
+    ))
+
+    # 3. max_num_seqs sweep with CUDA graphs
+    for seqs in [32, 64, 128, 256]:
+        configs.append(VLLMConfig(
+            tp=best_tp, max_num_seqs=seqs, gpu_mem=0.90,
+            enforce_eager=False, label=f"graph_s{seqs}",
+        ))
+
+    # 4. gpu_memory_utilization sweep with CUDA graphs + best seqs
+    for mem in [0.80, 0.95]:
+        configs.append(VLLMConfig(
+            tp=best_tp, max_num_seqs=64, gpu_mem=mem,
+            enforce_eager=False, label=f"graph_s64_m{int(mem*100)}",
+        ))
+
+    # 5. High concurrency + high mem
+    configs.append(VLLMConfig(
+        tp=best_tp, max_num_seqs=128, gpu_mem=0.95,
+        enforce_eager=False, label="graph_s128_m95",
+    ))
+    configs.append(VLLMConfig(
+        tp=best_tp, max_num_seqs=256, gpu_mem=0.95,
+        enforce_eager=False, label="graph_s256_m95",
     ))
 
     all_results = []

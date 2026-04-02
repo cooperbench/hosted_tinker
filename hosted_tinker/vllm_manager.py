@@ -27,7 +27,7 @@ class VLLMManager:
         model_name: str,
         port: int = 8001,
         gpu_ids: list[int] | None = None,
-        tensor_parallel_size: int = 1,
+        tensor_parallel_size: int | None = None,
         gpu_memory_utilization: float = 0.90,
         max_model_len: int = 32768,
         max_num_seqs: int = 16,
@@ -37,7 +37,7 @@ class VLLMManager:
         self.model_name = model_name
         self.port = port
         self.gpu_ids = gpu_ids or [0]
-        self.tensor_parallel_size = tensor_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size or len(self.gpu_ids)
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
@@ -69,11 +69,9 @@ class VLLMManager:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in self.gpu_ids)
         env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
-        # gIB NCCL fix: remove NCCL_NET=gIB which forces gIB-only transport.
-        # On machines without RDMA/IB hardware (e.g. a3-highgpu), this causes
-        # "Failed to initialize any NET plugin". Let NCCL auto-detect transports.
-        # The gIB tuner plugin still needs its config path.
-        env.pop("NCCL_NET", None)
+        # gIB NCCL fix: on GCP VMs without RDMA (a3-highgpu), the gIB NET
+        # plugin fails to init. Force Socket transport for intra-node comms.
+        env["NCCL_NET"] = "Socket"
         env.setdefault("NCCL_TUNER_CONFIG_PATH", "/usr/local/gib/configs")
 
         log_path = f"vllm_server_{self.port}.log"

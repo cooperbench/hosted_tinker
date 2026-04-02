@@ -375,6 +375,44 @@ Sequential runs on GPUs 0–3.
 | Megatron DDP | 4 | 4 | 29,268 | 82% | 56% | 10,655 | 96% | 77% |
 
 
+### FSDP2 Throughput Sweep on H100 (Qwen3.5-9B, max_seq_len=16384)
+
+4× H100 80GB (GPUs 4-7), 32 mixed-length examples (15% short ≤256, 70% mid, 15% long ≥12K), 211,042 total tokens, lora_rank=32. Sweeps micro_batch_size × gradient_checkpointing × remove_padding (sequence packing).
+
+| gc | packing | mbs | fwd tok/s | fwd GPU% | fwd mem% | fwd+bwd tok/s | fwd+bwd GPU% | fwd+bwd mem% |
+|----|---------|-----|-----------|----------|----------|---------------|--------------|--------------|
+| off | off | 1 | 45,633 | 70% | 38% | 14,385 | 89% | 52% |
+| off | off | 2 | 35,198 | 69% | 66% | 8,528 | 94% | 92% |
+| off | off | 4 | 24,347 | 77% | 92% | OOM | — | — |
+| on | off | 1 | 44,959 | 74% | 38% | 14,349 | 90% | 52% |
+| on | off | 2 | 37,171 | 80% | 66% | 8,530 | 94% | 92% |
+| on | off | 4 | 24,328 | 74% | 92% | OOM | — | — |
+| on | **on** | 1 | 44,907 | 74% | 48% | 14,328 | 88% | 58% |
+| on | **on** | 2 | 45,039 | 67% | 63% | **15,077** | 88% | 79% |
+| on | **on** | 4 | **45,638** | 59% | 83% | 14,376 | 88% | 88% |
+| off | **on** | 1 | 45,181 | 74% | 48% | 14,074 | 90% | 58% |
+| off | **on** | 2 | 45,633 | 70% | 63% | 15,068 | 91% | 79% |
+| off | **on** | 4 | 37,304 | 56% | 83% | 13,449 | 86% | 86% |
+
+
+### vLLM Inference Throughput on H100 (Qwen3.5-9B, max_seq_len=16384)
+
+4× H100 80GB (GPUs 0-3), TP=4, 64 concurrent requests, prompt_len~512, max_output_len=2048. Sweeps CUDA graphs, max_num_seqs, gpu_memory_utilization.
+
+| label | max_num_seqs | gpu_mem | CUDA graphs | tok/s | ± | ttft_p50 | wall_s |
+|-------|-------------|---------|-------------|-------|---|----------|--------|
+| eager_s16 | 16 | 0.90 | off | 424 | 0 | 81,364ms | 299.1s |
+| graph_s16 | 16 | 0.90 | **on** | 3,892 | 5 | 9,027ms | 31.7s |
+| graph_s32 | 32 | 0.90 | **on** | 6,779 | 26 | 1,611ms | 18.7s |
+| graph_s64 | 64 | 0.90 | **on** | 10,610 | 247 | 729ms | 11.6s |
+| graph_s128 | 128 | 0.90 | **on** | 10,698 | 385 | 755ms | 11.6s |
+| graph_s256 | 256 | 0.90 | **on** | 10,934 | 182 | 451ms | 11.4s |
+| **graph_s64_m80** | **64** | **0.80** | **on** | **10,996** | **125** | **486ms** | **11.4s** |
+| graph_s64_m95 | 64 | 0.95 | **on** | 10,717 | 357 | 647ms | 11.4s |
+| graph_s128_m95 | 128 | 0.95 | **on** | 10,608 | 77 | 461ms | 11.1s |
+| graph_s256_m95 | 256 | 0.95 | **on** | 10,552 | 244 | 617ms | 11.4s |
+
+
 ### Backend Memory Comparison (Qwen3-30B-A3B, 4 GPUs)
 
 | Backend | Memory/GPU | Parallelism | Max Batch for 32K |

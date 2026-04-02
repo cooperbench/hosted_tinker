@@ -110,15 +110,14 @@ class FSDP2Backend(AbstractBackend):
         env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         env["HF_HUB_OFFLINE"] = "1"
         # GCP VMs set NCCL_NET=gIB for multi-node clusters but
-        # libibverbs.so is not installed on single-node VMs.
-        # Also strip /usr/local/gib from LD_LIBRARY_PATH — the gIB shim
-        # plugin loads via LD path even with NCCL_NET_PLUGIN="" and crashes
-        # when libibverbs.so is missing.
-        env["NCCL_NET_PLUGIN"] = ""
-        env.pop("NCCL_NET", None)
+        # libibverbs.so / gIB NET plugin fails on single-node VMs without RDMA.
+        # Force Socket transport and strip gIB from LD_LIBRARY_PATH so the
+        # gIB libnccl-net.so plugin doesn't load and interfere.
+        env["NCCL_NET"] = "Socket"
         raw_ldpath = env.get("LD_LIBRARY_PATH", "")
-        fixed_ldpath = ":".join(p for p in raw_ldpath.split(":") if "gib" not in p.lower() and p)
-        env["LD_LIBRARY_PATH"] = fixed_ldpath
+        env["LD_LIBRARY_PATH"] = ":".join(
+            p for p in raw_ldpath.split(":") if p and "gib" not in p.lower()
+        )
         env.pop("NCCL_P2P_DISABLE", None)
 
         logger.info(f"Launching FSDP2 workers on GPUs {gpu_ids} (port {master_port})")

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import pickle
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +33,19 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_pickle(obj: object, path: str) -> None:
+    """Write a pickle file atomically via tmp + rename."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(obj, f)
+        os.rename(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
 
 # Loss functions (same as pytorch_backend.py)
 _DEFAULT_CLIP_LOW = 0.8
@@ -261,6 +275,13 @@ def main():
 
             micro_batch_size = cmd.get("micro_batch_size", args.micro_batch_size)
 
+            # When remove_padding is enabled, process one sequence at a time
+            # (effective mbs=1) to avoid cross-sequence attention leakage.
+            # Packing multiple sequences into [1, total_tokens] without an
+            # attention mask causes tokens to attend across document boundaries,
+            # making logprobs dependent on batch composition.
+            effective_mbs = 1 if args.remove_padding else micro_batch_size
+
             # Interleave indices across ranks so each rank gets a mix of short and
             # long sequences, balancing total token count per rank.
             sorted_indices = sorted(range(n_examples), key=lambda i: len(all_input_ids[i]))
@@ -273,80 +294,54 @@ def main():
             # micro-batches, so we synchronise the count: ranks that run out of
             # real data run a 1-token dummy forward (+ backward if training) to
             # keep FSDP collectives in lock-step across all ranks.
-            n_my_mbs = max(1, (len(my_indices) + micro_batch_size - 1) // micro_batch_size) if my_indices else 0
+            n_my_mbs = max(1, (len(my_indices) + effective_mbs - 1) // effective_mbs) if my_indices else 0
             mb_counts = [None] * world_size
             dist.all_gather_object(mb_counts, n_my_mbs, group=obj_group)
             n_total_mbs = max(mb_counts) if mb_counts else 1
 
             for mb_i in range(n_total_mbs):
-                real_start = mb_i * micro_batch_size
+                real_start = mb_i * effective_mbs
                 is_dummy = real_start >= len(my_indices)
                 if is_dummy:
                     mb_indices = []
                     seqs = [[pad_id]]  # 1-token dummy keeps FSDP happy
                 else:
-                    mb_indices = my_indices[real_start : real_start + micro_batch_size]
+                    mb_indices = my_indices[real_start : real_start + effective_mbs]
                     seqs = [all_input_ids[i] for i in mb_indices]
 
                 if args.remove_padding and not is_dummy:
-                    # --- Packed (remove-padding) path ---
-                    # Concatenate all sequences into a single flat tensor [1, total_tokens]
-                    seq_lens_mb = [len(s) for s in seqs]
-                    flat_ids = []
-                    flat_pos = []
-                    for s in seqs:
-                        flat_ids.extend(s)
-                        flat_pos.extend(range(len(s)))  # position resets at each boundary
-                    input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-                    position_ids = torch.tensor(flat_pos, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+                    # --- Remove-padding path (single sequence per forward) ---
+                    s = seqs[0]
+                    sl = len(s)
+                    idx = mb_indices[0]
+                    input_ids = torch.tensor(s, dtype=torch.long, device=device).unsqueeze(0)  # [1, sl]
 
                     if compute_grad:
-                        out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
+                        out = model(input_ids=input_ids, use_cache=False)
                     else:
                         with torch.no_grad():
-                            out = model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
+                            out = model(input_ids=input_ids, use_cache=False)
 
-                    log_probs = F.log_softmax(out.logits[0], dim=-1)  # [T, V]
+                    log_probs = F.log_softmax(out.logits[0], dim=-1)  # [sl, V]
                     del out
 
-                    # Split packed logits back into per-example logprobs
-                    total_loss = None
-                    offset = 0
-                    _gpu_lp = []
-                    _gpu_loss = []
-                    _gpu_idx = []
-                    for j, idx in enumerate(mb_indices):
-                        sl = seq_lens_mb[j]
-                        lp_slice = log_probs[offset : offset + sl]  # [sl, V]
-                        tgt = torch.tensor(all_targets[idx][:sl], dtype=torch.long, device=device)
-                        target_lp = lp_slice.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                    tgt = torch.tensor(all_targets[idx][:sl], dtype=torch.long, device=device)
+                    target_lp = log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
-                        _gpu_lp.append(target_lp.detach().float())
-                        _gpu_idx.append(idx)
+                    all_logprobs[idx] = target_lp.detach().float().cpu().tolist()
 
-                        if compute_grad:
-                            wt = torch.tensor(all_weights[idx][:sl], dtype=torch.bfloat16, device=device)
-                            slp_t = torch.tensor(all_slp[idx][:sl], dtype=torch.bfloat16, device=device)
-                            adv_t = torch.tensor(all_adv[idx][:sl], dtype=torch.bfloat16, device=device)
-                            loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
-                            loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
-                            _gpu_loss.append((-(target_lp * wt)).detach().float())
-                            total_loss = loss_j if total_loss is None else total_loss + loss_j
-                        else:
-                            all_losses[idx] = [0.0] * sl
-                        offset += sl
-
-                    # Batched GPU→CPU transfer
-                    for k, idx in enumerate(_gpu_idx):
-                        all_logprobs[idx] = _gpu_lp[k].cpu().tolist()
-                        if k < len(_gpu_loss):
-                            all_losses[idx] = _gpu_loss[k].cpu().tolist()
-                    del _gpu_lp, _gpu_loss, _gpu_idx
+                    if compute_grad:
+                        wt = torch.tensor(all_weights[idx][:sl], dtype=torch.bfloat16, device=device)
+                        slp_t = torch.tensor(all_slp[idx][:sl], dtype=torch.bfloat16, device=device)
+                        adv_t = torch.tensor(all_adv[idx][:sl], dtype=torch.bfloat16, device=device)
+                        loss_fn = LOSS_FN_MAP.get(all_loss_fns[idx], cross_entropy_loss)
+                        loss_j = loss_fn(target_lp, wt, slp_t, adv_t, all_loss_configs[idx])
+                        all_losses[idx] = (-(target_lp * wt)).detach().float().cpu().tolist()
+                        (loss_j / world_size).backward()
+                    else:
+                        all_losses[idx] = [0.0] * sl
 
                     del log_probs, input_ids
-
-                    if compute_grad and total_loss is not None:
-                        (total_loss / world_size).backward()
 
                 else:
                     # --- Padded (original) path ---
@@ -430,8 +425,7 @@ def main():
                             merged_loss[i] = ls
 
                 result = {"logprobs": merged_lp, "losses": merged_loss}
-                with open(args.result_file, "wb") as f:
-                    pickle.dump(result, f)
+                _atomic_pickle(result, args.result_file)
 
         elif cmd_type == "optim_step":
             adam = cmd["adam_params"]
@@ -466,8 +460,7 @@ def main():
                 save_file(lora_state, os.path.join(save_dir, "adapter_model.safetensors"))
 
                 result = {"grad_norm": grad_norm, "lora_path": save_dir}
-                with open(args.result_file, "wb") as f:
-                    pickle.dump(result, f)
+                _atomic_pickle(result, args.result_file)
 
             del state
 
@@ -483,8 +476,7 @@ def main():
                 save_dir = cmd["save_dir"]
                 os.makedirs(save_dir, exist_ok=True)
                 save_file(lora_state, os.path.join(save_dir, "adapter_model.safetensors"))
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"saved": True}, f)
+                _atomic_pickle({"saved": True}, args.result_file)
 
         dist.barrier()
 

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import pickle
+import tempfile
 import time
 
 import torch
@@ -25,6 +26,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_pickle(obj: object, path: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(obj, f)
+        os.rename(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
 
 # Loss functions (same as pytorch_backend.py)
 _CL, _CH = 0.8, 1.2
@@ -213,8 +226,7 @@ def main():
                             merged_lp[i] = lp
                             merged_loss[i] = ls
 
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"logprobs": merged_lp, "losses": merged_loss}, f)
+                _atomic_pickle({"logprobs": merged_lp, "losses": merged_loss}, args.result_file)
 
         elif cmd["type"] == "optim_step":
             adam = cmd["adam_params"]
@@ -274,8 +286,7 @@ def main():
                 with open(os.path.join(save_dir, "adapter_config.json"), "w") as cf:
                     json.dump(adapter_cfg, cf)
 
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"grad_norm": grad_norm, "lora_path": save_dir}, f)
+                _atomic_pickle({"grad_norm": grad_norm, "lora_path": save_dir}, args.result_file)
 
         elif cmd["type"] == "save_checkpoint":
             if rank == 0:
@@ -284,8 +295,7 @@ def main():
                 lora_state = {k: v.cpu().contiguous() for k, v in model.state_dict().items()
                               if "lora_" in k or "modules_to_save" in k}
                 save_file(lora_state, os.path.join(save_dir, "adapter_model.safetensors"))
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"saved": True}, f)
+                _atomic_pickle({"saved": True}, args.result_file)
 
         # Skip dist.barrier() — broadcast_object_list at the top of each
         # loop iteration provides sufficient synchronization.

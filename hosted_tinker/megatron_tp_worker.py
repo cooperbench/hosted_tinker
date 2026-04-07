@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import pickle
+import tempfile
 import time
 
 import torch
@@ -20,6 +21,17 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_pickle(obj: object, path: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(obj, f)
+        os.rename(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def main():
@@ -196,8 +208,7 @@ def main():
 
             # Only rank 0 writes result (all ranks have same logprobs due to TP gather)
             if rank == 0:
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"logprobs": all_lp, "losses": all_loss}, f)
+                _atomic_pickle({"logprobs": all_lp, "losses": all_loss}, args.result_file)
 
         elif cmd["type"] == "optim_step":
             adam = cmd["adam_params"]
@@ -221,8 +232,7 @@ def main():
                 os.makedirs(save_dir, exist_ok=True)
                 save_file(adapter_state, os.path.join(save_dir, "adapter_model.safetensors"))
 
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"grad_norm": grad_norm, "lora_path": save_dir}, f)
+                _atomic_pickle({"grad_norm": grad_norm, "lora_path": save_dir}, args.result_file)
 
         elif cmd["type"] == "save_checkpoint":
             if rank == 0:
@@ -230,8 +240,7 @@ def main():
                 os.makedirs(save_dir, exist_ok=True)
                 adapter_state = {n: p.cpu().contiguous() for n, p in model.named_parameters() if p.requires_grad}
                 save_file(adapter_state, os.path.join(save_dir, "adapter_model.safetensors"))
-                with open(args.result_file, "wb") as f:
-                    pickle.dump({"saved": True}, f)
+                _atomic_pickle({"saved": True}, args.result_file)
 
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()

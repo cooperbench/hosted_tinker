@@ -13,6 +13,7 @@ import logging
 import os
 import pickle
 import random
+import tempfile
 import subprocess
 import sys
 import tempfile
@@ -183,15 +184,20 @@ class FSDP2Backend(AbstractBackend):
 
     def _send_command(self, cmd: dict) -> None:
         """Write command pickle for rank 0 to read."""
-        with open(self._cmd_file, "wb") as f:
-            pickle.dump(cmd, f)
+        fd, tmp = tempfile.mkstemp(dir=self._ipc_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(cmd, f)
+            os.rename(tmp, self._cmd_file)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
     def _read_result(self, timeout: float = 1800) -> dict:
         """Read result pickle from rank 0."""
         start = time.time()
         while time.time() - start < timeout:
             if os.path.exists(self._result_file):
-                time.sleep(0.01)  # Small delay to ensure write is complete
                 try:
                     with open(self._result_file, "rb") as f:
                         result = pickle.load(f)

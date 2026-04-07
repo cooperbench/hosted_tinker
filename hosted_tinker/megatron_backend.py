@@ -18,6 +18,7 @@ import os
 import pickle
 import random
 import subprocess
+import tempfile
 import sys
 import tempfile
 import time
@@ -187,14 +188,19 @@ class MegatronBackend(AbstractBackend):
                 logger.info("Initial LoRA synced to vLLM")
 
     def _send_command(self, cmd: dict) -> None:
-        with open(self._cmd_file, "wb") as f:
-            pickle.dump(cmd, f)
+        fd, tmp = tempfile.mkstemp(dir=self._ipc_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(cmd, f)
+            os.rename(tmp, self._cmd_file)
+        except BaseException:
+            os.unlink(tmp)
+            raise
 
     def _read_result(self, timeout: float = 300) -> dict:
         start = time.time()
         while time.time() - start < timeout:
             if os.path.exists(self._result_file):
-                time.sleep(0.01)
                 try:
                     with open(self._result_file, "rb") as f:
                         result = pickle.load(f)

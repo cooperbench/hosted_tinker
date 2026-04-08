@@ -42,6 +42,8 @@ A standalone, self-hosted implementation of the [Tinker](https://tinker-docs.thi
 # Install
 pip install -e .
 pip install peft transformers torch vllm safetensors
+# For Qwen3.5 (fast GatedDeltaNet kernels — ~7× faster fwd+bwd):
+pip install flash-linear-attention causal-conv1d
 
 # Launch (PEFT backend, single machine)
 python -m hosted_tinker.api \
@@ -362,14 +364,14 @@ Two configs run in parallel across GPU slots 0–3 and 4–7.
 32 mixed-length examples (15% ≤256 tok, 70% mid, 15% ≥6K tok), 120,712 total tokens, max_seq_len=8192, lora_rank=32, gc=on.
 Sequential runs on GPUs 0–3.
 
+> **Qwen3.5 requires `fla` + `causal-conv1d`** for fast GatedDeltaNet kernels.
+> Without them, 28/32 layers fall back to a slow PyTorch implementation (~7× slower fwd+bwd).
+> Install: `uv pip install flash-linear-attention causal-conv1d`
+
 | backend | GPUs | mbs | fwd tok/s | GPU util (fwd) | GPU mem (fwd) | fwd+bwd tok/s | GPU util (fwd+bwd) | GPU mem (fwd+bwd) |
 |---------|------|-----|-----------|----------------|---------------|---------------|--------------------|----|
-| FSDP2 | 4 | 1 | 25,684 | 50% | 30% | 9,216 | 67% | 39% |
-| FSDP2 | 4 | 2 | 27,334 | 52% | 47% | 10,298 | 74% | 61% |
-| FSDP2 | 4 | 4 | 17,043 | 62% | 56% | 7,963 | 75% | 85% |
-| FSDP2 (remove_padding) | 4 | 1 | 44,040 | 58% | 34% | 14,906 | 80% | 43% |
-| FSDP2 (remove_padding) | 4 | 2 | **49,153** | 59% | 48% | **17,869** | 83% | 55% |
-| FSDP2 (remove_padding) | 4 | 4 | 48,994 | 50% | 53% | 11,260 | 76% | 72% |
+| FSDP2 (no fla) | 4 | 2 | 17,000 | 64% | 79% | 1,963 | 73% | 79% |
+| FSDP2 (fla) | 4 | 2 | **44,182** | 57% | — | **14,937** | 82% | — |
 | Megatron DDP | 4 | 1 | 25,394 | 76% | 32% | 10,250 | 74% | 40% |
 | Megatron DDP | 4 | 2 | 34,936 | 87% | 40% | 12,891 | 96% | 59% |
 | Megatron DDP | 4 | 4 | 29,268 | 82% | 56% | 10,655 | 96% | 77% |
@@ -377,22 +379,16 @@ Sequential runs on GPUs 0–3.
 
 ### FSDP2 Throughput Sweep on H100 (Qwen3.5-9B, max_seq_len=16384)
 
-4× H100 80GB (GPUs 4-7), 32 mixed-length examples (15% short ≤256, 70% mid, 15% long ≥12K), 211,042 total tokens, lora_rank=32. Sweeps micro_batch_size × gradient_checkpointing × remove_padding (sequence packing).
+4× H100 80GB (GPUs 4-7), 32 mixed-length examples (15% short ≤256, 70% mid, 15% long ≥12K), 211,042 total tokens, lora_rank=32. Requires `fla` + `causal-conv1d` for Qwen3.5 fast kernels.
 
-| gc | packing | mbs | fwd tok/s | fwd GPU% | fwd mem% | fwd+bwd tok/s | fwd+bwd GPU% | fwd+bwd mem% |
-|----|---------|-----|-----------|----------|----------|---------------|--------------|--------------|
-| off | off | 1 | 45,633 | 70% | 38% | 14,385 | 89% | 52% |
-| off | off | 2 | 35,198 | 69% | 66% | 8,528 | 94% | 92% |
-| off | off | 4 | 24,347 | 77% | 92% | OOM | — | — |
-| on | off | 1 | 44,959 | 74% | 38% | 14,349 | 90% | 52% |
-| on | off | 2 | 37,171 | 80% | 66% | 8,530 | 94% | 92% |
-| on | off | 4 | 24,328 | 74% | 92% | OOM | — | — |
-| on | **on** | 1 | 44,907 | 74% | 48% | 14,328 | 88% | 58% |
-| on | **on** | 2 | 45,039 | 67% | 63% | **15,077** | 88% | 79% |
-| on | **on** | 4 | **45,638** | 59% | 83% | 14,376 | 88% | 88% |
-| off | **on** | 1 | 45,181 | 74% | 48% | 14,074 | 90% | 58% |
-| off | **on** | 2 | 45,633 | 70% | 63% | 15,068 | 91% | 79% |
-| off | **on** | 4 | 37,304 | 56% | 83% | 13,449 | 86% | 86% |
+| gc | mbs | fwd tok/s | fwd GPU% | fwd mem% | fwd+bwd tok/s | fwd+bwd GPU% | fwd+bwd mem% |
+|----|-----|-----------|----------|----------|---------------|--------------|--------------|
+| off | 1 | 45,633 | 70% | 38% | 14,385 | 89% | 52% |
+| off | 2 | 35,198 | 69% | 66% | 8,528 | 94% | 92% |
+| off | 4 | 24,347 | 77% | 92% | OOM | — | — |
+| on | 1 | 44,959 | 74% | 38% | 14,349 | 90% | 52% |
+| on | 2 | 37,171 | 80% | 66% | 8,530 | 94% | 92% |
+| on | 4 | 24,328 | 74% | 92% | OOM | — | — |
 
 
 ### vLLM Inference Throughput on H100 (Qwen3.5-9B, max_seq_len=16384)
